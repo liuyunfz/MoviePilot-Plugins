@@ -1,0 +1,15 @@
+{
+  "ptautotask": {
+    "name": "PT自动任务",
+    "description": "用来执行一些站点的定期任务，包括但不限于签到、喊话、领取任务等",
+    "labels": "每日任务,喊话",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/liuyunfz/MoviePilot-Plugins/main/icons/ptautotask.png",
+    "author": "liuyunfz",
+    "level": 2,
+    "v2": true,
+    "history": {
+      "v1.0.0": "首个版本，支持车站等七个站点"
+    }
+  }
+} 
