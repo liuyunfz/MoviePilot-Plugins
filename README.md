@@ -27,7 +27,7 @@
 ### PT自动任务 (PTAutoTask)
 本插件移植自[PT_AUTO_TASK](https://github.com/liuyunfz/PT_AUTO_TASK)，插件会自动读取支持的站点并显示在配置页面中，用户只需选择对应站点需要启动的任务运行即可。
 
-本插件使用站点模块化设计，欢迎各位进行贡献，详细的开发教程请参考：[待完善]()
+本插件使用站点模块化设计，欢迎各位进行贡献，详细的开发教程请参考：[PTAutoTask开发说明](doc/develop_ptautotask.md)
 
 ## 许可证
 
