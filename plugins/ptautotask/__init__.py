@@ -356,13 +356,19 @@ class PTAutoTask(_PluginBase):
                                     name="PT_Task")
             # 关闭一次性开关
             self._onlyonce = False
-            self.update_config({
+            # 在更新持久配置时保留所有站点开关，避免覆盖为 False
+            payload = {
                 "onlyonce": False,
                 "cron": self._cron,
                 "enabled": self._enabled,
                 "notify": self._notify,
                 "history_days": self._history_days,
-            })
+            }
+            for site_config in sites_configs:
+                # 保留当前内存中该站点配置的值（之前已从 config 赋值）
+                payload[site_config] = getattr(self, site_config, False)
+
+            self.update_config(payload)
         # 周期运行
         elif self._cron:
             logger.info(f"站点周期任务服务启动，周期：{self._cron}")
