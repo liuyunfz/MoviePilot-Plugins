@@ -29,7 +29,7 @@ class PTAutoTask(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/liuyunfz/MoviePilot-Plugins/main/icons/ptautotask.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "liuyunfz"
     # 作者主页
@@ -414,10 +414,10 @@ class PTAutoTask(_PluginBase):
         except Exception as e:
             logger.error(f"安排重试任务失败: {e}")
 
-
     def __do_tasks(self):
         """
         站点周期任务执行（按 run 保存历史并合并通知）
+        优化：抽取状态判断与单个任务执行逻辑，减少重复代码。
         """
         if hasattr(self, '_auto_task_in') and self._auto_task_in:
             logger.info("已有周期任务在执行，跳过当前任务")
@@ -431,128 +431,142 @@ class PTAutoTask(_PluginBase):
             _site_notify_map: Dict[str, List[str]] = {}  # 按站点分组的通知行
             _site_order: List[str] = []  # 保持站点顺序
 
-            for support_site in filter_sites:
+            def is_fail(status: Optional[str]) -> bool:
+                if not status:
+                    return False
+                st = status.lower()
+                return ("失败" in status) or ("异常" in status) or ("error" in st)
+
+            def convert_result_to_status(result) -> str:
+                if isinstance(result, str):
+                    return result
+                if isinstance(result, dict):
+                    return result.get("status") or result.get("message") or "执行完成"
+                if result is None:
+                    return "执行完成"
+                return repr(result)
+
+            def _run_single_task(support_site: dict, task: dict):
+                """
+                执行单个任务并返回 (record, notify_line, failed_bool)
+                若任务被跳过返回 (None, None, None)
+                """
                 site_name = support_site.get("name") or support_site.get("domain") or "未知站点"
                 domain = support_site.get("domain") or ""
                 cookie = support_site.get("cookie")
+                task_id = task.get("id")
+                if not task_id:
+                    logger.debug(f"任务无 id，跳过: {task}")
+                    return None, None, None
 
-                tasks = support_site.get("tasks") or []
-                for task in tasks:
-                    try:
-                        task_id = task.get("id")
-                        if not task_id:
-                            continue
+                enabled = getattr(self, task_id, False)
+                if not enabled:
+                    logger.debug(f"任务 {task_id} 被配置为禁用，跳过")
+                    return None, None, None
 
-                        enabled = getattr(self, task_id, False)
-                        if not enabled:
-                            logger.debug(f"任务 {task_id} 被配置为禁用，跳过")
-                            continue
+                func_obj = task.get("func")
+                if not func_obj:
+                    logger.warning(f"任务 {task_id} 未包含可执行函数，跳过")
+                    return None, None, None
 
-                        func_obj = task.get("func")
-                        if not func_obj:
-                            logger.warning(f"任务 {task_id} 未包含可执行函数，跳过")
-                            continue
+                # 获取方法名与所属类（若为绑定方法）
+                try:
+                    method_name = getattr(getattr(func_obj, "__func__", func_obj), "__name__", None)
+                except Exception:
+                    method_name = None
 
+                tasks_cls = None
+                try:
+                    if hasattr(func_obj, "__self__") and func_obj.__self__ is not None:
+                        tasks_cls = func_obj.__self__.__class__
+                except Exception:
+                    tasks_cls = None
+
+                if not method_name:
+                    logger.warning(f"无法确定 {task_id} 的方法名，跳过")
+                    return None, None, None
+
+                now_str = datetime.now(tz=pytz.timezone(settings.TZ)).strftime('%Y-%m-%d %H:%M:%S')
+
+                try:
+                    # 执行任务
+                    result = None
+                    if tasks_cls:
+                        # 尝试用 cookie 构造新实例
                         try:
-                            method_name = getattr(getattr(func_obj, "__func__", func_obj), "__name__", None)
-                        except Exception:
-                            method_name = None
+                            new_instance = tasks_cls(cookie=cookie)
+                        except TypeError:
+                            new_instance = tasks_cls()
+                            if cookie is not None:
+                                setattr(new_instance, "cookie", cookie)
+                        method = getattr(new_instance, method_name, None)
+                        if not method:
+                            raise RuntimeError(f"在新实例中未找到方法 {method_name}")
+                        logger.info(f"开始执行任务 {task_id}（站点: {site_name}）")
+                        result = method()
+                    else:
+                        logger.info(f"使用原绑定方法执行任务 {task_id}（站点: {site_name}，可能无 cookie）")
+                        result = func_obj()
 
-                        tasks_cls = None
-                        try:
-                            if hasattr(func_obj, "__self__") and func_obj.__self__ is not None:
-                                tasks_cls = func_obj.__self__.__class__
-                        except Exception:
-                            tasks_cls = None
+                    status_text = convert_result_to_status(result)
 
-                        if not method_name:
-                            logger.warning(f"无法确定 {task_id} 的方法名，跳过")
-                            continue
+                    record = {
+                        "date": now_str,
+                        "site": site_name,
+                        "domain": domain,
+                        "task_id": task_id,
+                        "task_label": task.get("label"),
+                        "status": status_text,
+                    }
 
-                        result = None
-                        if tasks_cls:
-                            try:
-                                new_instance = None
-                                try:
-                                    new_instance = tasks_cls(cookie=cookie)
-                                except TypeError:
-                                    new_instance = tasks_cls()
-                                    if cookie is not None:
-                                        setattr(new_instance, "cookie", cookie)
-                                method = getattr(new_instance, method_name, None)
-                                if not method:
-                                    raise RuntimeError(f"在新实例中未找到方法 {method_name}")
-                                logger.info(f"开始执行任务 {task_id}（站点: {site_name}）")
-                                result = method()
-                            except Exception:
-                                raise
-                        else:
-                            logger.info(f"使用原绑定方法执行任务 {task_id}（站点: {site_name}，可能无 cookie）")
-                            result = func_obj()
+                    failed = is_fail(status_text)
+                    emoji = "❌" if failed else "✅"
+                    line = f"{emoji} {task.get('label') or task_id}: {status_text}"
 
-                        # 构造单个任务记录（假设任务返回字符串状态）
-                        now_str = datetime.now(tz=pytz.timezone(settings.TZ)).strftime('%Y-%m-%d %H:%M:%S')
-                        # 兼容不同返回类型：优先把字符串作为状态
-                        if isinstance(result, str):
-                            status_text = result
-                        elif isinstance(result, dict):
-                            status_text = result.get("status") or result.get("message") or "执行完成"
-                        elif result is None:
-                            status_text = "执行完成"
-                        else:
-                            status_text = repr(result)
+                    if failed:
+                        logger.warning(f"{site_name} - {task_id} 返回失败: {status_text}")
+                    else:
+                        logger.info(f"{site_name} - {task_id} 执行成功: {status_text}")
 
-                        record = {
-                            "date": now_str,
-                            "site": site_name,
-                            "domain": domain,
-                            "task_id": task_id,
-                            "task_label": task.get("label"),
-                            "status": status_text,
-                        }
+                    return record, line, failed
 
-                        # 记录到本次运行集合
-                        run_records.append(record)
-                        is_fail = "失败" in status_text or "error" in status_text.lower() or "异常" in status_text
-                        emoji = "❌" if is_fail else "✅"
-                        line = f"{emoji} {task.get('label') or task_id}: {status_text}"
-                        if site_name not in _site_order:
-                            _site_order.append(site_name)
-                        _site_notify_map.setdefault(site_name, []).append(line)
-                        # 判断失败关键字
-                        if "失败" in status_text or "error" in status_text.lower() or "异常" in status_text:
-                            any_failure = True
-                            logger.warning(f"{site_name} - {task_id} 返回失败: {status_text}")
-                        else:
-                            logger.info(f"{site_name} - {task_id} 执行成功: {status_text}")
+                except Exception as e:
+                    # 捕获执行期异常，构造失败记录
+                    logger.error(f"{site_name} - {task.get('id')} 异常: {e}", exc_info=True)
+                    err_status = f"执行失败: {str(e)}"
+                    record = {
+                        "date": now_str,
+                        "site": site_name,
+                        "domain": domain,
+                        "task_id": task.get("id"),
+                        "task_label": task.get("label"),
+                        "status": err_status,
+                    }
+                    line = f"❌ {task.get('label') or task.get('id')}: {err_status}"
+                    return record, line, True
 
-                    except Exception as e:
+            # 主循环：对每个站点与任务调用 _run_single_task，统一处理返回
+            for support_site in filter_sites:
+                for task in support_site.get("tasks") or []:
+                    rec, line, failed = _run_single_task(support_site, task)
+                    if rec is None:
+                        continue
+                    run_records.append(rec)
+                    site_name = rec.get("site") or rec.get("domain") or "未知站点"
+                    if site_name not in _site_order:
+                        _site_order.append(site_name)
+                    _site_notify_map.setdefault(site_name, []).append(line)
+                    if failed:
                         any_failure = True
-                        logger.error(f"{site_name} - {task.get('id')} 异常: {e}", exc_info=True)
-                        now_str = datetime.now(tz=pytz.timezone(settings.TZ)).strftime('%Y-%m-%d %H:%M:%S')
-                        record = {
-                            "date": now_str,
-                            "site": site_name,
-                            "domain": domain,
-                            "task_id": task.get("id"),
-                            "task_label": task.get("label"),
-                            "status": f"执行失败: {str(e)}",
-                        }
-                        run_records.append(record)
-                        err_line = f"❌ {task.get('label') or task.get('id')}: 执行失败: {str(e)}"
-                        if site_name not in _site_order:
-                            _site_order.append(site_name)
-                        _site_notify_map.setdefault(site_name, []).append(err_line)
-                        run_records.append(record)
+
             # 根据失败与配置判断是否安排重试，并在需要时更新失败记录的 retry 信息
             if any_failure and self._retry_count and self._retry_count > 0:
                 self._current_retry = min(self._current_retry + 1, self._retry_count)
                 if self._current_retry <= self._retry_count:
                     logger.info(f"检测到执行失败，安排第 {self._current_retry} 次重试")
-                    # 在失败记录中标注重试信息
                     for rec in run_records:
                         st = rec.get("status", "")
-                        if "失败" in st or "异常" in st or "error" in st.lower():
+                        if is_fail(st):
                             rec["retry"] = {
                                 "enabled": True,
                                 "current": self._current_retry,
@@ -563,7 +577,6 @@ class PTAutoTask(_PluginBase):
                 else:
                     logger.info("已达到最大重试次数，不再安排重试")
             else:
-                # 没有失败或不需要重试时重置计数
                 self._current_retry = 0
 
             # 保存本次运行为一个 list（each run is a list of records）
@@ -584,7 +597,6 @@ class PTAutoTask(_PluginBase):
                     parts.append(f"🔔 {site}")
                     parts.extend(lines)
                     parts.append("────────────────────")  # 站点间分隔符
-                # 移除最后一个分隔符
                 if parts and parts[-1].startswith("─"):
                     parts = parts[:-1]
                 body = "\n".join(parts)
