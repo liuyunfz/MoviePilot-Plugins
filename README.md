@@ -9,6 +9,7 @@
 | PT 自动任务 | `PTAutoTask` | 1.2.0 | 多站点签到、喊话、领取任务与福利，按站点汇总结果 | [配置与开发](doc/ptautotask.md) |
 | CD2 Webhook 通知 CMS | `CloudDrive2Webhook` | 1.1.1 | 命中文件事件后通知 CMS，整理中可跳过 | [Webhook 接入](doc/clouddrive2webhook.md) |
 | NodeSeek 签到 | `NodeSeekSign` | 1.2.1 | NodeSeek 签到，支持浏览器会话及旧配置迁移 | [配置说明](doc/nodeseeksign.md) |
+| F-Cloudpan 签到 | `FCloudpanSign` | 1.0.0 | OAuth 授权、自动签到、积分/VIP 资料和签到记录 | [应用授权指南](doc/fcloudpansign.md) |
 
 ## 安装与更新
 
@@ -28,13 +29,14 @@
 
 - **PT 自动任务**：读取 MoviePilot 已配置站点的 Cookie。
 - **NodeSeek**：使用目标站点 Cookie，或配置账号用于自动登录。
+- **F-Cloudpan**：管理员先注册第三方应用；用户跳转云盘确认授权，插件自动接收回调。仅申请 `account:read`、`account:write`，无需复制 Cookie 或访问令牌。当前刷新授权最长 30 天，到期需要重新授权。
 - **CD2 Webhook**：使用 MoviePilot API Key，可附加 Webhook 令牌；CMS Token 单独配置。
 
 凭据只填写在自己的 MoviePilot 配置中，不要放入 Issue、截图或提交文件。普通签到与随机奖励的收益规则由对应站点决定。
 
 ## 开发与验证
 
-PT 自动任务移植自 [PT_AUTO_TASK](https://github.com/liuyunfz/PT_AUTO_TASK)，新增站点可参考 [站点开发说明](doc/develop_ptautotask.md)。
+PT 自动任务移植自 [PT_AUTO_TASK](https://github.com/liuyunfz/PT_AUTO_TASK)，新增站点可参考 [站点开发说明](doc/develop_ptautotask.md)。F-Cloudpan 界面参考 [madrays/MoviePilot-Plugins](https://github.com/madrays/MoviePilot-Plugins) 的原生卡片布局。
 
 离线定向测试：
 
@@ -43,7 +45,7 @@ python -m pip install requests 'APScheduler<4' pytz fastapi httpx pytest
 python -m pytest tests -q
 ```
 
-测试覆盖已发布插件的任务结果、调度或事件处理。站点和 CMS 的线上行为需在用户自己的环境中确认。测试不代表已经在完整 MoviePilot 容器或所有站点环境中验证。
+测试覆盖任务结果、调度、Webhook 路径与凭据保护，以及 F-Cloudpan OAuth、令牌轮换和签到逻辑。F-Cloudpan 另完成本地真实 API 联调；其他站点和 CMS 的线上行为需在用户自己的环境中确认。测试不代表已经在完整 MoviePilot 容器或所有站点环境中验证。
 
 ## 许可证
 

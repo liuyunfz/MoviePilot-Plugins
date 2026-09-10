@@ -1,0 +1,639 @@
+"""Isolated MP storage + actual requests/FastAPI/scheduler contract tests."""
+
+import base64
+import copy
+import importlib.util
+import json
+import logging
+import sys
+import threading
+import time
+import types
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+import requests
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+
+class PluginBase:
+    def __init__(self):
+        self.data = {}
+        self.saved_config = None
+        self.messages = []
+
+    def get_data(self, key):
+        return copy.deepcopy(self.data.get(key))
+
+    def save_data(self, key, value):
+        self.data[key] = copy.deepcopy(value)
+
+    def update_config(self, config):
+        self.saved_config = copy.deepcopy(config)
+
+    def post_message(self, **kwargs):
+        self.messages.append(kwargs)
+
+
+# Load the plugin against MP boundary doubles, leaving real protocol dependencies in use.
+saved_modules = {
+    name: sys.modules.get(name)
+    for name in (
+        "app",
+        "app.core",
+        "app.core.config",
+        "app.log",
+        "app.plugins",
+        "app.schemas",
+    )
+}
+for name in saved_modules:
+    sys.modules[name] = types.ModuleType(name)
+sys.modules["app.core.config"].settings = types.SimpleNamespace(TZ="Asia/Shanghai")
+sys.modules["app.log"].logger = logging.getLogger("fcloud-test")
+sys.modules["app.plugins"]._PluginBase = PluginBase
+sys.modules["app.schemas"].NotificationType = types.SimpleNamespace(SiteMessage="site")
+plugin_path = Path(__file__).resolve().parents[1] / "plugins" / "fcloudpansign"
+spec = importlib.util.spec_from_file_location(
+    "tested_fcloudpansign",
+    plugin_path / "__init__.py",
+    submodule_search_locations=[str(plugin_path)],
+)
+plugin_module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = plugin_module
+spec.loader.exec_module(plugin_module)
+for name, value in saved_modules.items():
+    if value is None:
+        sys.modules.pop(name, None)
+    else:
+        sys.modules[name] = value
+CloudError = plugin_module.CloudError
+CloudClient = plugin_module.CloudClient
+FCloudpanSign = plugin_module.FCloudpanSign
+
+
+def pair(letter="a"):
+    return {
+        "access_token": "fco_access_" + letter * 43,
+        "refresh_token": "fco_refresh_" + letter * 43,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": "account:read account:write",
+    }
+
+
+ACCOUNT = {
+    "sub": "42",
+    "name": "云盘测试用户",
+    "avatar": None,
+    "points": 100,
+    "vip_level": 2,
+    "vip_expires_at": None,
+}
+
+
+def overview(checked=False, points=100, reward=5):
+    return {
+        "today": "2026-09-10",
+        "checkedInToday": checked,
+        "todayReward": reward if checked else None,
+        "currentStreak": 3 if checked else 2,
+        "totalDays": 9 if checked else 8,
+        "points": points,
+        "pointName": "云盘积分",
+        "standardReward": 5,
+        "lasVegasMin": -5,
+        "lasVegasMax": 10,
+        "recent": [{"checkedInOn": "2026-09-10", "reward": reward}] if checked else [],
+    }
+
+
+class Upstream:
+    def __init__(self):
+        self.requests = []
+        self.checked = False
+        self.balance = 100
+        self.reward = 5
+        self.sub = "42"
+        self.exchange_count = 0
+        self.fail_refresh = False
+        self.fail_post_after_commit = False
+        self.deny_write = False
+        self.fail_revoke = False
+        self.unauthorized_once = False
+        self.nonjson = False
+        self.redirect = False
+        self.granted_scope = "account:read account:write"
+
+    def handle(self, method, path, headers, body):
+        self.requests.append((method, path, dict(headers), body))
+        if self.redirect:
+            return 302, {"error": "redirect"}
+        if self.nonjson:
+            return 200, None
+        if path == "/oauth/token":
+            self.exchange_count += 1
+            form = parse_qs(body)
+            if form.get("grant_type") == ["refresh_token"] and self.fail_refresh:
+                return 500, {"error": "do not log upstream secret"}
+            tokens = pair(chr(ord("a") + self.exchange_count))
+            tokens["scope"] = self.granted_scope
+            return 200, tokens
+        if path == "/oauth/account":
+            if self.unauthorized_once:
+                self.unauthorized_once = False
+                return 401, {"error": "invalid_token"}
+            return 200, {**ACCOUNT, "sub": self.sub, "points": self.balance}
+        if path == "/oauth/revoke":
+            return (500, {"error": "server_error"}) if self.fail_revoke else (200, {})
+        if path == "/api/check-in":
+            if method == "GET":
+                return 200, {
+                    "code": 0,
+                    "data": overview(self.checked, self.balance, self.reward),
+                }
+            if self.deny_write:
+                return 403, {"message": "do not log upstream secret"}
+            already = self.checked
+            if not already:
+                self.checked = True
+                self.balance += self.reward
+            if self.fail_post_after_commit:
+                return 504, {"message": "gateway timeout"}
+            return 200, {
+                "code": 0,
+                "data": {
+                    "alreadyCheckedIn": already,
+                    "reward": self.reward,
+                    "balanceAfter": self.balance,
+                },
+            }
+        return 404, {}
+
+
+@pytest.fixture
+def upstream():
+    fixture = Upstream()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.respond()
+
+        def do_POST(self):
+            self.respond()
+
+        def respond(self):
+            body = self.rfile.read(
+                int(self.headers.get("Content-Length", "0"))
+            ).decode()
+            status, result = fixture.handle(self.command, self.path, self.headers, body)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(result).encode()
+                if result is not None
+                else b"<html>upstream secret</html>"
+            )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    fixture.issuer = f"http://127.0.0.1:{server.server_port}"
+    yield fixture
+    server.shutdown()
+    server.server_close()
+    worker.join()
+
+
+@pytest.fixture
+def plugin(upstream, monkeypatch):
+    # Jobs remain inspectable but never execute during unrelated assertions.
+    monkeypatch.setattr(plugin_module.BackgroundScheduler, "start", lambda self: None)
+    instance = FCloudpanSign()
+    config = {
+        **instance.DEFAULTS,
+        "issuer": upstream.issuer,
+        "mp_url": "https://mp.example",
+        "client_id": "fixture:id",
+        "client_secret": "fixture/secret+value",
+    }
+    instance.init_plugin(config)
+    yield instance
+    instance.stop_service()
+
+
+def authorize_locally(plugin, *, expired=False):
+    state = plugin._read()
+    state.update(
+        tokens={
+            **pair(),
+            "expires_at": time.time() - 1 if expired else time.time() + 3600,
+        },
+        grant_expires_at=time.time() + 30 * 86400,
+    )
+    plugin._save(state)
+
+
+def browser(plugin):
+    app = FastAPI()
+    for route in plugin.get_api():
+        route = dict(route)
+        route.pop("allow_anonymous")
+        route["path"] = plugin._api_path + route["path"]
+        app.add_api_route(**route)
+    return TestClient(app, base_url="https://mp.example", follow_redirects=False)
+
+
+def begin(plugin, client):
+    plugin.init_plugin({**plugin._config, "prepare_auth": True})
+    pending = plugin._read()["pending"]
+    response = client.get(
+        plugin._api_path + "/oauth/start", params={"ticket": pending["ticket"]}
+    )
+    assert response.status_code == 302
+    return response, {
+        "state": pending["state"],
+        "iss": plugin._config["issuer"],
+        "code": "fixture-code",
+    }
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.com",
+        "https://user:pw@example.com",
+        "https://example.com/path",
+        "https://example.com?token=x",
+        "https://example.com#x",
+        "https://example.com:bad",
+        "javascript:alert(1)",
+        "https://exam\\ple.com",
+    ],
+)
+def test_rejects_unsafe_origins(url):
+    with pytest.raises(CloudError):
+        plugin_module.origin_url(url)
+
+
+def test_pkce_rfc7636_vector():
+    assert (
+        plugin_module.challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")
+        == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    )
+
+
+def test_oauth_roundtrip_checks_basic_pkce_and_private_cookie(plugin, upstream):
+    with browser(plugin) as client:
+        response, params = begin(plugin, client)
+        query = parse_qs(urlsplit(response.headers["location"]).query)
+        assert query["scope"] == ["account:read account:write"]
+        assert query["code_challenge_method"] == ["S256"]
+        assert "HttpOnly" in response.headers["set-cookie"]
+        assert "Secure" in response.headers["set-cookie"]
+        callback = client.get(plugin._api_path + "/oauth/callback", params=params)
+        assert callback.status_code == 200
+        assert callback.headers["cache-control"] == "no-store"
+        assert plugin._read()["account"]["sub"] == "42"
+        assert plugin._read()["overview"]["points"] == 100
+        token_request = upstream.requests[0]
+        credentials = base64.b64decode(token_request[2]["Authorization"][6:]).decode()
+        assert credentials == "fixture%3Aid:fixture%2Fsecret%2Bvalue"
+        form = parse_qs(token_request[3])
+        assert "application/x-www-form-urlencoded" in token_request[2]["Content-Type"]
+        assert query["code_challenge"] == [
+            plugin_module.challenge(form["code_verifier"][0])
+        ]
+        assert not any(
+            row[0] == "POST" and row[1] == "/api/check-in" for row in upstream.requests
+        )
+        assert (
+            client.get(plugin._api_path + "/oauth/callback", params=params).status_code
+            == 400
+        )
+        assert upstream.exchange_count == 1
+
+
+@pytest.mark.parametrize(
+    "attack", ["state", "issuer", "cookie", "duplicate", "expiry", "unicode"]
+)
+def test_callback_rejects_forgery_without_exchange(plugin, upstream, attack):
+    with browser(plugin) as client:
+        _, params = begin(plugin, client)
+        if attack == "state":
+            params["state"] = "wrong"
+        elif attack == "issuer":
+            params["iss"] = "https://evil.example"
+        elif attack == "unicode":
+            params["state"] = "恶意参数"
+        elif attack == "cookie":
+            client.cookies.clear()
+        elif attack == "duplicate":
+            params["state"] = [params["state"], params["state"]]
+        else:
+            state = plugin._read()
+            state["pending"]["expires_at"] = 0
+            plugin._save(state)
+        assert (
+            client.get(plugin._api_path + "/oauth/callback", params=params).status_code
+            == 400
+        )
+        assert upstream.exchange_count == 0
+
+
+def test_user_denial_preserves_existing_grant(plugin, upstream):
+    authorize_locally(plugin)
+    before = plugin._read()["tokens"]
+    with browser(plugin) as client:
+        _, params = begin(plugin, client)
+        params.pop("code")
+        params["error"] = "access_denied"
+        assert (
+            client.get(plugin._api_path + "/oauth/callback", params=params).status_code
+            == 400
+        )
+    assert plugin._read()["tokens"] == before
+    assert upstream.exchange_count == 0
+
+
+def test_failed_code_exchange_is_never_replayed(plugin, upstream):
+    upstream.granted_scope = "account:read"
+    with browser(plugin) as client:
+        _, params = begin(plugin, client)
+        assert (
+            client.get(plugin._api_path + "/oauth/callback", params=params).status_code
+            == 400
+        )
+        assert (
+            client.get(plugin._api_path + "/oauth/callback", params=params).status_code
+            == 400
+        )
+    assert upstream.exchange_count == 1
+    assert not plugin._read().get("tokens")
+
+
+def test_refresh_rotation_survives_reload_and_has_fixed_grant_expiry(plugin, upstream):
+    authorize_locally(plugin, expired=True)
+    deadline = plugin._read()["grant_expires_at"]
+    assert plugin.run(sign=False)["success"]
+    assert upstream.exchange_count == 1
+    assert plugin._read()["tokens"]["access_token"] == pair("b")["access_token"]
+    assert plugin._read()["grant_expires_at"] == deadline
+    plugin.init_plugin(plugin._config)
+    assert plugin.run(sign=False)["success"]
+    assert upstream.exchange_count == 1
+
+
+def test_refresh_failure_blocks_replay_across_reloads(plugin, upstream):
+    authorize_locally(plugin, expired=True)
+    upstream.fail_refresh = True
+    assert not plugin.run(sign=False)["success"]
+    assert plugin._read()["refresh_in_flight"]
+    plugin.init_plugin(plugin._config)
+    assert not plugin.run(sign=False)["success"]
+    assert upstream.exchange_count == 1
+
+
+def test_401_refreshes_once(plugin, upstream):
+    authorize_locally(plugin)
+    upstream.unauthorized_once = True
+    assert plugin.run(sign=False)["success"]
+    assert upstream.exchange_count == 1
+
+
+def test_concurrent_jobs_serialize_rotation_and_signin(plugin, upstream):
+    authorize_locally(plugin, expired=True)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: plugin.run(), range(4)))
+    assert all(row["success"] for row in results)
+    assert upstream.exchange_count == 1
+    assert (
+        len([r for r in upstream.requests if r[0:2] == ("POST", "/api/check-in")]) == 1
+    )
+    assert plugin._read()["account"]["points"] == 105
+
+
+def test_expired_grant_does_not_call_upstream(plugin, upstream):
+    authorize_locally(plugin)
+    state = plugin._read()
+    state["grant_expires_at"] = 0
+    plugin._save(state)
+    assert not plugin.run()["success"]
+    assert not upstream.requests
+
+
+def test_read_only_refresh_never_signs(plugin, upstream):
+    authorize_locally(plugin)
+    assert plugin.run(sign=False)["success"]
+    assert all(row[0] == "GET" for row in upstream.requests)
+
+
+def test_random_negative_rewards_and_notification(plugin, upstream):
+    authorize_locally(plugin)
+    plugin._config.update(mode="LAS_VEGAS", notify=True)
+    upstream.reward = -3
+    assert plugin.run()["success"]
+    state = plugin._read()
+    assert state["history"][0]["reward"] == -3
+    assert state["account"]["points"] == 97
+    assert len(plugin.messages) == 1
+    assert "97" in plugin.messages[0]["text"]
+    post = next(
+        row for row in upstream.requests if row[0:2] == ("POST", "/api/check-in")
+    )
+    assert json.loads(post[3]) == {"mode": "LAS_VEGAS"}
+
+
+def test_post_504_reconciles_without_resubmission(plugin, upstream):
+    authorize_locally(plugin)
+    upstream.fail_post_after_commit = True
+    assert plugin.run()["success"]
+    assert (
+        len([r for r in upstream.requests if r[0:2] == ("POST", "/api/check-in")]) == 1
+    )
+    assert "核实" in plugin._read()["history"][0]["detail"]
+
+
+def test_insufficient_scope_does_not_refresh_or_retry(plugin, upstream):
+    authorize_locally(plugin)
+    upstream.deny_write = True
+    assert not plugin.run()["success"]
+    assert upstream.exchange_count == 0
+    assert (
+        len([r for r in upstream.requests if r[0:2] == ("POST", "/api/check-in")]) == 1
+    )
+
+
+def test_account_mismatch_blocks_before_signin(plugin, upstream):
+    authorize_locally(plugin)
+    assert plugin.run(sign=False)["success"]
+    upstream.sub = "99"
+    assert not plugin.run()["success"]
+    assert plugin._read()["blocked"]
+    assert not plugin._read().get("account")
+    assert not any(r[0:2] == ("POST", "/api/check-in") for r in upstream.requests)
+
+
+def test_configuration_change_removes_other_identity(plugin):
+    authorize_locally(plugin)
+    plugin.run(sign=False)
+    plugin.init_plugin({**plugin._config, "client_secret": "new-fixture-secret"})
+    assert not plugin._read().get("tokens")
+    assert not plugin._read().get("account")
+    assert not plugin._read()["history"]
+
+
+def test_revoke_clears_state_and_failed_revoke_blocks(plugin, upstream):
+    authorize_locally(plugin)
+    upstream.fail_revoke = True
+    plugin.init_plugin({**plugin._config, "revoke_auth": True})
+    assert plugin._read()["blocked"]
+    assert plugin._read()["tokens"]
+    assert not plugin.run()["success"]
+    upstream.fail_revoke = False
+    plugin.init_plugin({**plugin._config, "revoke_auth": True})
+    assert not plugin._read().get("tokens")
+    assert plugin._read()["history"] == []
+
+
+def test_disabled_and_oneshot_scheduling_preserve_config(plugin):
+    assert plugin._scheduler.get_jobs() == []
+    plugin.init_plugin({**plugin._config, "onlyonce": True, "notify": True})
+    assert [job.id for job in plugin._scheduler.get_jobs()] == ["once"]
+    assert plugin.saved_config["onlyonce"] is False
+    assert plugin.saved_config["notify"] is True
+    plugin.init_plugin({**plugin._config, "enabled": True})
+    job = plugin._scheduler.get_job("daily")
+    assert job.trigger.jitter == 300
+    assert str(job.trigger.timezone) == "Asia/Shanghai"
+    plugin.init_plugin({**plugin._config, "cron": "bad"})
+    assert not plugin._scheduler.get_jobs()
+    assert "Cron" in plugin._read()["status"]
+
+
+def test_stale_scheduled_generation_is_ignored(plugin, upstream):
+    authorize_locally(plugin)
+    generation = plugin._generation
+    plugin.init_plugin(plugin._config)
+    plugin._scheduled(generation, True)
+    assert not upstream.requests
+
+
+@pytest.mark.parametrize("failure", ["nonjson", "redirect"])
+def test_http_errors_are_sanitized_and_redirects_not_followed(
+    plugin, upstream, failure
+):
+    authorize_locally(plugin)
+    setattr(upstream, failure, True)
+    assert not plugin.run()["success"]
+    assert "upstream secret" not in json.dumps(plugin.data)
+    assert len(upstream.requests) == 1
+
+
+def test_network_exceptions_never_expose_credentials(plugin, monkeypatch):
+    authorize_locally(plugin)
+
+    def fail(*args, **kwargs):
+        raise requests.Timeout("contains secret:" + pair()["access_token"])
+
+    monkeypatch.setattr(requests.Session, "request", fail)
+    assert not plugin.run()["success"]
+    assert pair()["access_token"] not in json.dumps(plugin._read()["history"])
+
+
+def test_ui_has_native_cards_and_no_secrets_or_network_calls(plugin, upstream):
+    authorize_locally(plugin)
+    plugin.run(sign=False)
+    calls = len(upstream.requests)
+    form, defaults = plugin.get_form()
+    page = plugin.get_page()
+    serialized = json.dumps([form, defaults, page], ensure_ascii=False)
+    assert "VCard" in serialized and "近 14 日签到" in serialized
+    assert "class-" not in serialized
+    assert plugin._config["client_secret"] not in serialized
+    assert pair()["access_token"] not in serialized
+    assert pair()["refresh_token"] not in serialized
+    assert len(upstream.requests) == calls
+    assert "今日奖励" in serialized or "上次签到日奖励" in serialized
+
+
+def test_history_prunes_age_and_caps_size(plugin):
+    authorize_locally(plugin)
+    state = plugin._read()
+    state["history"] = [{"time": time.time(), "status": "old"}] * 550 + [
+        {"time": 0, "status": "expired"}
+    ]
+    plugin._save(state)
+    plugin.run(sign=False)
+    assert len(plugin._read()["history"]) == 500
+    assert all(row["time"] > 0 for row in plugin._read()["history"])
+
+
+def test_refresh_stops_before_network_if_marker_cannot_be_saved(
+    plugin, upstream, monkeypatch
+):
+    authorize_locally(plugin, expired=True)
+
+    def failed_save(*args):
+        raise RuntimeError("SQL includes " + pair()["refresh_token"])
+
+    monkeypatch.setattr(plugin, "save_data", failed_save)
+    with pytest.raises(CloudError) as error:
+        plugin._access(plugin._read())
+    assert pair()["refresh_token"] not in str(error.value)
+    assert upstream.exchange_count == 0
+
+
+def test_crash_after_rotation_leaves_persisted_inflight_marker(
+    plugin, upstream, monkeypatch
+):
+    authorize_locally(plugin, expired=True)
+    original = plugin.save_data
+
+    def fail_new_pair(key, state):
+        if state.get("tokens", {}).get("access_token") == pair("b")["access_token"]:
+            raise RuntimeError("simulated persistence failure")
+        original(key, state)
+
+    monkeypatch.setattr(plugin, "save_data", fail_new_pair)
+    with pytest.raises(CloudError):
+        plugin._access(plugin._read())
+    assert plugin._read()["refresh_in_flight"]
+    monkeypatch.setattr(plugin, "save_data", original)
+    plugin.init_plugin(plugin._config)
+    assert not plugin.run()["success"]
+    assert upstream.exchange_count == 1
+
+
+def test_new_authorization_clears_previous_user_cache(plugin, upstream):
+    authorize_locally(plugin)
+    plugin.run(sign=False)
+    assert plugin._read()["history"]
+    upstream.sub = "99"
+    with browser(plugin) as client:
+        _, params = begin(plugin, client)
+        assert (
+            client.get(plugin._api_path + "/oauth/callback", params=params).status_code
+            == 200
+        )
+    assert plugin._read()["account"]["sub"] == "99"
+    assert plugin._read()["history"] == []
+
+
+def test_page_expiry_and_refresh_warning_override_stale_success(plugin):
+    authorize_locally(plugin)
+    state = plugin._read()
+    state.update(status="已授权", grant_expires_at=0)
+    plugin._save(state)
+    assert "30 天授权已到期" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    state.update(refresh_in_flight=True)
+    plugin._save(state)
+    assert "刷新结果未知" in json.dumps(plugin.get_page(), ensure_ascii=False)

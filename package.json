@@ -48,5 +48,18 @@
       "v1.2.1": "整理发布：修复调度开关、重复任务与停止流程",
       "v1.2.0": "兼容旧配置，支持随机签到、账号登录与浏览器会话模式"
     }
+  },
+  "FCloudpanSign": {
+    "name": "F-Cloudpan 签到",
+    "description": "通过应用授权自动签到，读取积分、VIP 与签到记录",
+    "labels": "签到,云盘,OAuth,F-Cloudpan",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/liuyunfz/MoviePilot-Plugins/main/icons/fcloudpansign.svg",
+    "author": "liuyunfz",
+    "level": 2,
+    "v2": true,
+    "history": {
+      "v1.0.0": "首次发布：OAuth 授权码与 PKCE、自动轮换、定时签到、资料卡、近 14 日签到记录及授权撤销"
+    }
   }
 }
