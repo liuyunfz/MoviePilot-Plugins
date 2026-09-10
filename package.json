@@ -34,5 +34,19 @@
       "v1.0.1": "按 CloudDrive2 官方 webhook 字段适配 file_system_watcher 和 mount_point_watcher",
       "v1.0.0": "首个版本，支持 CD2 云下载 webhook、目录搬运和 CMS 通知"
     }
+  },
+  "NodeSeekSign": {
+    "name": "NodeSeek签到",
+    "description": "自动完成 NodeSeek 论坛每日签到，支持随机签到、失败重试，集成CF绕过",
+    "labels": "签到,NodeSeek",
+    "version": "1.2.1",
+    "icon": "https://www.nodeseek.com/favicon.ico",
+    "author": "liuyunfz",
+    "level": 2,
+    "v2": true,
+    "history": {
+      "v1.2.1": "整理发布：修复调度开关、重复任务与停止流程",
+      "v1.2.0": "兼容旧配置，支持随机签到、账号登录与浏览器会话模式"
+    }
   }
 }
