@@ -1,34 +1,46 @@
-# MoviePilot-Plugins
+# MoviePilot 插件库
 
-这是一个MoviePilot的**第三方插件库**
+适用于 MoviePilot V2 的第三方插件，提供 PT 站点任务、论坛与云盘签到，以及 CloudDrive2 文件事件联动。
 
-## 插件列表
+## 插件一览
 
-### PT自动任务 (PTAutoTask)
-- 支持多种PT站点
-- 自动签到、做任务、领取奖励等功能
-- 定时执行，支持自定义时间间隔
-- 动态读取支持站点列表，方便扩展
-- **模块化设计，欢迎PR贡献更多PT站点支持**
+| 插件 | 插件 ID | 版本 | 功能 | 使用说明 |
+| --- | --- | --- | --- | --- |
+| PT 自动任务 | `PTAutoTask` | 1.2.0 | 多站点签到、喊话、领取任务与福利，按站点汇总结果 | [配置与开发](doc/ptautotask.md) |
 
+## 安装与更新
 
-## 安装说明
+1. 在 MoviePilot **插件商店 → 添加第三方仓库**中填写：
 
-**本仓库为第三方插件库，需在MoviePilot中添加仓库地址使用**
+   ```text
+   https://github.com/liuyunfz/MoviePilot-Plugins
+   ```
 
-1. 在MoviePilot的插件商店页面，点击"添加第三方仓库"
-2. 添加本仓库地址：`https://github.com/liuyunfz/MoviePilot-Plugins`
-3. 添加成功后，在插件列表中找到需要的插件
-4. 安装并启用插件
-5. 根据下方说明配置插件参数
+2. 安装所需插件，按照对应使用说明填写配置。
+3. 首次运行后查看插件详情与日志，确认账号、执行结果和通知设置。
+4. 更新时在插件商店刷新本仓库并升级。各插件的版本及变更记录以 [package.json](package.json) 为准。
 
-## 使用说明
+本地调试可将 `plugins/<插件目录>` 复制到 MoviePilot 的 `app/plugins` 下，再重载插件。签到和 Webhook 插件同时提供对应 ZIP 源码包；解压后保留插件目录结构。ZIP 不包含 Cookie、配置、运行历史或 Python 缓存。
 
-### PT自动任务 (PTAutoTask)
-本插件移植自[PT_AUTO_TASK](https://github.com/liuyunfz/PT_AUTO_TASK)，插件会自动读取支持的站点并显示在配置页面中，用户只需选择对应站点需要启动的任务运行即可。
+## 如何选择认证方式
 
-本插件使用站点模块化设计，欢迎各位进行贡献，详细的开发教程请参考：[PTAutoTask开发说明](doc/develop_ptautotask.md)
+- **PT 自动任务**：读取 MoviePilot 已配置站点的 Cookie。
+
+凭据只填写在自己的 MoviePilot 配置中，不要放入 Issue、截图或提交文件。普通签到与随机奖励的收益规则由对应站点决定。
+
+## 开发与验证
+
+PT 自动任务移植自 [PT_AUTO_TASK](https://github.com/liuyunfz/PT_AUTO_TASK)，新增站点可参考 [站点开发说明](doc/develop_ptautotask.md)。
+
+离线定向测试：
+
+```bash
+python -m pip install requests 'APScheduler<4' pytz fastapi httpx pytest
+python -m pytest tests -q
+```
+
+测试覆盖已发布插件的任务结果、调度或事件处理。站点和 CMS 的线上行为需在用户自己的环境中确认。测试不代表已经在完整 MoviePilot 容器或所有站点环境中验证。
 
 ## 许可证
 
-本项目采用 GPLv3 - 详见 [LICENSE](LICENSE) 文件 
+本项目采用 [GPLv3](LICENSE)。

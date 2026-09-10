@@ -20,6 +20,8 @@ import pkgutil
 import inspect
 from pathlib import Path
 
+from .base.BaseTask import TaskResult
+
 
 class PTAutoTask(_PluginBase):
     # 插件名称
@@ -29,7 +31,7 @@ class PTAutoTask(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/liuyunfz/MoviePilot-Plugins/main/icons/ptautotask.png"
     # 插件版本
-    plugin_version = "1.1.1"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "liuyunfz"
     # 作者主页
@@ -438,6 +440,14 @@ class PTAutoTask(_PluginBase):
                 return ("失败" in status) or ("异常" in status) or ("error" in st)
 
             def convert_result_to_status(result) -> str:
+                if isinstance(result, TaskResult):
+                    if result.message:
+                        return result.message
+                    if isinstance(result.data, dict):
+                        message = result.data.get("status") or result.data.get("message") or result.data.get("result")
+                        if isinstance(message, str):
+                            return message
+                    return "执行成功" if result.success else "执行失败"
                 if isinstance(result, str):
                     return result
                 if isinstance(result, dict):
@@ -464,7 +474,7 @@ class PTAutoTask(_PluginBase):
                     logger.debug(f"任务 {task_id} 被配置为禁用，跳过")
                     return None, None, None
 
-                func_obj = task.get("func")
+                func_obj = inspect.unwrap(task.get("func")) if task.get("func") else None
                 if not func_obj:
                     logger.warning(f"任务 {task_id} 未包含可执行函数，跳过")
                     return None, None, None
@@ -509,6 +519,7 @@ class PTAutoTask(_PluginBase):
                         result = func_obj()
 
                     status_text = convert_result_to_status(result)
+                    failed = not result.success if isinstance(result, TaskResult) else is_fail(status_text)
 
                     record = {
                         "date": now_str,
@@ -517,9 +528,9 @@ class PTAutoTask(_PluginBase):
                         "task_id": task_id,
                         "task_label": task.get("label"),
                         "status": status_text,
+                        "success": not failed,
                     }
 
-                    failed = is_fail(status_text)
                     emoji = "❌" if failed else "✅"
                     line = f"{emoji} {task.get('label') or task_id}: {status_text}"
 
@@ -541,6 +552,7 @@ class PTAutoTask(_PluginBase):
                         "task_id": task.get("id"),
                         "task_label": task.get("label"),
                         "status": err_status,
+                        "success": False,
                     }
                     line = f"❌ {task.get('label') or task.get('id')}: {err_status}"
                     return record, line, True
@@ -561,12 +573,12 @@ class PTAutoTask(_PluginBase):
 
             # 根据失败与配置判断是否安排重试，并在需要时更新失败记录的 retry 信息
             if any_failure and self._retry_count and self._retry_count > 0:
-                self._current_retry = min(self._current_retry + 1, self._retry_count)
-                if self._current_retry <= self._retry_count:
+                if self._current_retry < self._retry_count:
+                    self._current_retry += 1
                     logger.info(f"检测到执行失败，安排第 {self._current_retry} 次重试")
                     for rec in run_records:
                         st = rec.get("status", "")
-                        if is_fail(st):
+                        if not rec.get("success", not is_fail(st)):
                             rec["retry"] = {
                                 "enabled": True,
                                 "current": self._current_retry,

@@ -21,7 +21,6 @@ class Car(NexusPHP):
     def get_site_domain():
         return "carpt.net"
 
-
     def send_messagebox(self, message: str, callback=None) -> str:
         return super().send_messagebox(message)
 
@@ -35,9 +34,11 @@ class Tasks(BaseTask):
 
     @task_info(label="Car 任务领取", hint="领取Car站点的天天快乐任务")
     def daily_claim_task(self):
-        task_id_list = ["5"]
-        return "\n".join([self.client.claim_task(item) for item in task_id_list])
-
+        task_id = '5'
+        rsp = self.client.claim_task(task_id)
+        if rsp == "认领人数已达上限":
+            return self.fail(rsp)
+        return self.ok(message=rsp)
 
     def daily_checkin(self):
         return self.client.attendance()
