@@ -16,5 +16,23 @@
       "v1.0.1": "修复仅运行一次后站点配置丢失的问题",
       "v1.0.0": "首个版本，支持车站等七个站点"
     }
+  },
+  "CloudDrive2Webhook": {
+    "name": "CD2 Webhook通知CMS",
+    "description": "接收 CloudDrive2 create webhook，命中指定路径后通知 CMS 整理",
+    "labels": "webhook,cloudrive2,115,CMS",
+    "version": "1.1.1",
+    "icon": "https://raw.githubusercontent.com/liuyunfz/MoviePilot-Plugins/main/icons/ptautotask.png",
+    "author": "liuyunfz",
+    "level": 2,
+    "v2": true,
+    "history": {
+      "v1.1.1": "修复目录匹配边界，移除 CMS 返回值及历史中的令牌和原始响应",
+      "v1.1.0": "改为仅接收 create 事件并命中指定路径时通知 CMS，整理任务进行中则跳过",
+      "v1.0.3": "调整为 CD2 云上传 -> webhook -> 移动文件 -> 通知 CMS 整理 的流程说明",
+      "v1.0.2": "CMS通知方式对齐 cmsnotify 插件，改为调用 /api/sync/lift_by_token",
+      "v1.0.1": "按 CloudDrive2 官方 webhook 字段适配 file_system_watcher 和 mount_point_watcher",
+      "v1.0.0": "首个版本，支持 CD2 云下载 webhook、目录搬运和 CMS 通知"
+    }
   }
 }
