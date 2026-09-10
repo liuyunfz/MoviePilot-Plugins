@@ -1,21 +1,32 @@
 """F-Cloudpan OAuth and check-in protocol. Never include upstream bodies in errors."""
 
-import base64
-import hashlib
 import ipaddress
 import math
 import re
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import requests
 
 SCOPES = "account:read account:write"
+DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+OAUTH_ERRORS = {
+    "authorization_pending": "等待用户在云盘确认",
+    "slow_down": "云盘要求降低授权查询频率",
+    "access_denied": "用户已拒绝授权",
+    "expired_token": "设备授权码已过期，请重新连接",
+    "invalid_grant": "本次授权已失效，请重新连接",
+    "invalid_client": "公共应用不存在或不可用，请检查 Client ID",
+    "invalid_scope": "应用未开放账户读取和签到所需权限",
+    "unauthorized_client": "此应用不支持公共设备授权",
+}
 
 
 class CloudError(Exception):
-    def __init__(self, message, status=0):
+    def __init__(self, message, status=0, code="", retry_after=0):
         super().__init__(message)
         self.status = status
+        self.code = code
+        self.retry_after = retry_after
 
 
 def origin_url(value):
@@ -56,14 +67,6 @@ def origin_url(value):
         ) from None
 
 
-def challenge(verifier):
-    return (
-        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
-        .rstrip(b"=")
-        .decode("ascii")
-    )
-
-
 def number(value):
     return (
         isinstance(value, (int, float))
@@ -73,27 +76,20 @@ def number(value):
 
 
 class CloudClient:
-    def __init__(self, issuer, client_id, client_secret, timeout=20):
+    def __init__(self, issuer, client_id, timeout=20):
         self.issuer = origin_url(issuer)
         self.client_id = client_id
-        self.client_secret = client_secret
         self.timeout = timeout
 
     def request(self, method, path, *, token=None, form=None, payload=None):
         headers = {
             "Accept": "application/json",
-            "User-Agent": "MoviePilot-FCloudpanSign/1.0.0",
+            "User-Agent": "MoviePilot-FCloudpanSign/1.1.0",
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
         if form is not None:
-            # OAuth Basic credentials use application/x-www-form-urlencoded escaping.
-            credentials = (
-                f"{quote(self.client_id, safe='')}:{quote(self.client_secret, safe='')}"
-            )
-            headers["Authorization"] = (
-                "Basic " + base64.b64encode(credentials.encode()).decode()
-            )
+            form = {**form, "client_id": self.client_id}
         try:
             # A fresh session avoids cookies, implicit .netrc credentials and connection retries.
             with requests.Session() as session:
@@ -109,27 +105,108 @@ class CloudClient:
                 ) as response:
                     status = response.status_code
                     if not 200 <= status < 300:
+                        # Never expose upstream descriptions, bodies, or unknown error names.
+                        code = ""
+                        if form is not None:
+                            try:
+                                error = response.json()
+                                candidate = (
+                                    error.get("error")
+                                    if isinstance(error, dict)
+                                    else None
+                                )
+                                if (
+                                    isinstance(candidate, str)
+                                    and candidate in OAUTH_ERRORS
+                                ):
+                                    code = candidate
+                            except ValueError:
+                                pass
+                        retry_after = response.headers.get("Retry-After", "")
+                        retry_after = (
+                            min(int(retry_after), 600)
+                            if re.fullmatch(r"[0-9]{1,8}", retry_after)
+                            else 0
+                        )
                         messages = {
                             400: "请求或授权已失效，请检查配置或重新授权",
-                            401: "应用凭据或用户授权已失效",
+                            401: "应用或用户授权已失效",
                             403: "缺少账户权限，或应用/用户当前不可用",
                             429: "调用频率受限，请稍后执行",
                         }
                         raise CloudError(
-                            messages.get(status, f"云盘接口异常（HTTP {status}）"),
+                            OAUTH_ERRORS.get(code)
+                            or messages.get(status, f"云盘接口异常（HTTP {status}）"),
                             status,
+                            code,
+                            retry_after,
                         )
                     try:
                         result = response.json()
                     except ValueError:
                         raise CloudError(
-                            "云盘未返回有效 JSON，请检查站点地址和反向代理"
+                            "云盘未返回有效 JSON，请检查站点地址和反向代理",
+                            code="invalid_response",
                         ) from None
         except requests.RequestException:
             raise CloudError("云盘连接失败或超时，本次请求结果未知") from None
         if not isinstance(result, dict):
-            raise CloudError("云盘响应格式不正确")
+            raise CloudError("云盘响应格式不正确", code="invalid_response")
         return result
+
+    def device_authorization(self):
+        result = self.request("POST", "/oauth/device/code", form={"scope": SCOPES})
+        interval = result.get("interval", 5)
+        if (
+            not isinstance(result.get("device_code"), str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{32,512}", result["device_code"])
+            or not isinstance(result.get("user_code"), str)
+            or not re.fullmatch(r"[A-Z0-9-]{4,32}", result["user_code"])
+            or not number(result.get("expires_in"))
+            or not 30 <= result["expires_in"] <= 1800
+            or not number(interval)
+            or not 1 <= interval <= 120
+        ):
+            raise CloudError("设备授权响应不完整，请重新连接")
+        for key in ("verification_uri", "verification_uri_complete"):
+            link = result.get(key)
+            if key == "verification_uri_complete" and link is None:
+                continue
+            try:
+                url = urlsplit(link) if isinstance(link, str) else None
+                valid = (
+                    url
+                    and len(link) <= 2048
+                    and not url.username
+                    and not url.password
+                    and not url.fragment
+                    and url.path == "/oauth/device"
+                    and (
+                        not url.query
+                        if key == "verification_uri"
+                        else parse_qs(url.query, keep_blank_values=True)
+                        == {"user_code": [result["user_code"]]}
+                    )
+                    and not any(c.isspace() or ord(c) < 32 for c in link)
+                    and "\\" not in link
+                    and origin_url(urlunsplit((url.scheme, url.netloc, "", "", "")))
+                    == self.issuer
+                )
+            except (ValueError, CloudError):
+                valid = False
+            if not valid:
+                raise CloudError("云盘确认地址无效或与站点不匹配")
+        return {
+            key: result[key]
+            for key in (
+                "device_code",
+                "user_code",
+                "verification_uri",
+                "verification_uri_complete",
+                "expires_in",
+            )
+            if key in result
+        } | {"interval": max(5, interval)}
 
     def tokens(self, form):
         result = self.request("POST", "/oauth/token", form=form)
@@ -145,7 +222,9 @@ class CloudClient:
             or not 60 <= result["expires_in"] <= 86400
             or not set(SCOPES.split()).issubset(str(result.get("scope", "")).split())
         ):
-            raise CloudError("令牌响应或授权权限不完整，请重新授权")
+            raise CloudError(
+                "令牌响应或授权权限不完整，请重新授权", code="invalid_response"
+            )
         return result
 
     def account(self, token):

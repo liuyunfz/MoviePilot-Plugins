@@ -7,7 +7,6 @@ import threading
 import time
 from datetime import datetime, timedelta
 from typing import ClassVar
-from urllib.parse import urlencode
 
 import pytz
 from app.core.config import settings
@@ -16,10 +15,8 @@ from app.plugins import _PluginBase
 from app.schemas import NotificationType
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import Request
-from fastapi.responses import HTMLResponse, RedirectResponse
 
-from .client import SCOPES, CloudClient, CloudError, challenge, origin_url
+from .client import DEVICE_GRANT, CloudClient, CloudError, origin_url
 from .ui import build_form, build_page
 
 
@@ -27,20 +24,18 @@ class FCloudpanSign(_PluginBase):
     plugin_name = "F-Cloudpan 签到"
     plugin_desc = "通过应用授权自动签到，读取积分、VIP 与签到记录"
     plugin_icon = "https://raw.githubusercontent.com/liuyunfz/MoviePilot-Plugins/main/icons/fcloudpansign.svg"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "liuyunfz"
     author_url = "https://github.com/liuyunfz"
     plugin_config_prefix = "fcloudpansign_"
     plugin_order = 26
     auth_level = 2
-    # Covers scheduler jobs, API callbacks and plugin reloads in one MP process.
+    # Covers scheduler jobs, device authorization and plugin reloads in one MP process.
     _lock = threading.RLock()
     _scheduler = None
     _generation = ""
     _config: ClassVar[dict] = {}
     _config_error = ""
-    _cookie_name = "fcloudpan_oauth"
-    _api_path = "/api/v1/plugin/FCloudpanSign"
     DEFAULTS: ClassVar[dict] = {
         "enabled": False,
         "notify": False,
@@ -48,10 +43,9 @@ class FCloudpanSign(_PluginBase):
         "refresh_now": False,
         "prepare_auth": False,
         "revoke_auth": False,
+        "cancel_auth": False,
         "issuer": "",
-        "mp_url": "",
         "client_id": "",
-        "client_secret": "",
         "cron": "30 9 * * *",
         "mode": "STANDARD",
         "history_days": 30,
@@ -79,28 +73,30 @@ class FCloudpanSign(_PluginBase):
         return CloudClient(
             self._config["issuer"],
             self._config["client_id"],
-            self._config["client_secret"],
             self._config["timeout"],
         )
-
-    def _redirect_uri(self):
-        return self._config["mp_url"] + self._api_path + "/oauth/callback"
 
     def init_plugin(self, config=None):
         self.stop_service()
         with self._lock:
             self._generation = secrets.token_hex(16)
-            self._config = {**self.DEFAULTS, **(config or {})}
+            self._config = {
+                key: (config or {}).get(key, value)
+                for key, value in self.DEFAULTS.items()
+            }
             self._config_error = ""
             try:
-                for key in ("issuer", "mp_url"):
-                    self._config[key] = origin_url(self._config[key])
-                for key in ("client_id", "client_secret"):
-                    self._config[key] = str(self._config.get(key) or "").strip()
-                    if not self._config[key]:
-                        raise CloudError(
-                            "请先填写云盘地址、MoviePilot 地址及应用 Client ID / Secret"
-                        )
+                self._config["issuer"] = origin_url(self._config["issuer"])
+                self._config["client_id"] = str(
+                    self._config.get("client_id") or ""
+                ).strip()
+                if (
+                    not self._config["client_id"]
+                    or len(self._config["client_id"]) > 256
+                ):
+                    raise CloudError(
+                        "请填写云盘地址和站点提供的公共 Client ID（无需 Secret）"
+                    )
                 for key, low, high in (
                     ("history_days", 1, 365),
                     ("timeout", 5, 60),
@@ -120,47 +116,52 @@ class FCloudpanSign(_PluginBase):
 
             actions = [
                 key
-                for key in ("prepare_auth", "revoke_auth", "onlyonce", "refresh_now")
+                for key in (
+                    "prepare_auth",
+                    "cancel_auth",
+                    "revoke_auth",
+                    "onlyonce",
+                    "refresh_now",
+                )
                 if self._config.get(key)
             ]
             # One-shot settings are reset before any network call or scheduling.
             for key in actions:
                 self._config[key] = False
-            if actions:
+            if actions or any(
+                key in (config or {}) for key in ("mp_url", "client_secret")
+            ):
                 self.update_config(dict(self._config))
             if self._config_error:
                 return
 
             fingerprint = hashlib.sha256(
-                "\0".join(
-                    self._config[key]
-                    for key in ("issuer", "mp_url", "client_id", "client_secret")
+                (
+                    "public-device-v1\0"
+                    + "\0".join(self._config[key] for key in ("issuer", "client_id"))
                 ).encode()
             ).hexdigest()
             state = self._read()
             if state.get("binding") != fingerprint:
                 state = {
                     "binding": fingerprint,
-                    "status": "配置已更新，请授权",
+                    "status": "请连接公共应用；从 1.0 升级需重新授权，并在云盘撤销旧应用授权",
                     "history": [],
                 }
                 self._save(state)
             if "revoke_auth" in actions:
                 self._revoke()
                 return
-            if "prepare_auth" in actions:
+            if "cancel_auth" in actions:
                 state = self._read()
-                state["pending"] = {
-                    "ticket": secrets.token_urlsafe(32),
-                    "state": secrets.token_urlsafe(32),
-                    "verifier": secrets.token_urlsafe(48),
-                    "expires_at": time.time() + 600,
-                    "redirect_uri": self._redirect_uri(),
-                }
-                state["status"] = "授权链接已生成，请打开插件详情继续"
+                state.pop("pending", None)
+                state["status"] = "本次连接已取消；已有授权保持不变"
                 self._save(state)
+            elif "prepare_auth" in actions:
+                self._prepare_device()
 
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+            self._schedule_poll()
             if self._config["enabled"]:
                 try:
                     trigger = CronTrigger.from_crontab(
@@ -219,162 +220,138 @@ class FCloudpanSign(_PluginBase):
             {"binding": state.get("binding"), "status": "已解除授权", "history": []}
         )
 
-    @staticmethod
-    def _html(message, status=200):
-        # All messages are fixed local strings, never authorization parameters or upstream HTML.
-        response = HTMLResponse(
-            "<!doctype html><html lang='zh-CN'><meta charset='utf-8'>"
-            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            "<title>F-Cloudpan 授权</title><body><h2>F-Cloudpan × MoviePilot</h2><p>"
-            + message
-            + "</p><p>请关闭此页，返回 MoviePilot 插件详情。</p></body></html>",
-            status_code=status,
-            headers={
-                "Cache-Control": "no-store",
-                "Referrer-Policy": "no-referrer",
-                "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
-        return response
-
-    def oauth_start(self, request: Request):
-        with self._lock:
-            state = self._read()
-            pending = state.get("pending") or {}
-            tickets = request.query_params.getlist("ticket")
-            if (
-                self._config_error
-                or len(tickets) != 1
-                or not pending.get("ticket")
-                or not secrets.compare_digest(
-                    tickets[0].encode(), pending["ticket"].encode()
-                )
-                or pending.get("expires_at", 0) <= time.time()
-                or pending.get("started")
-            ):
-                return self._html("授权入口无效或已使用，请在配置页重新生成。", 400)
-            browser_secret = secrets.token_urlsafe(32)
-            pending.update(
-                started=True,
-                browser_hash=hashlib.sha256(browser_secret.encode()).hexdigest(),
-            )
+    def _prepare_device(self):
+        state = self._read()
+        # A new code is only requested by an explicit user action.
+        state.pop("pending", None)
+        state["status"] = "正在申请设备授权"
+        self._save(state)
+        try:
+            device = self._client().device_authorization()
+        except CloudError as exc:
+            state["status"] = "连接未开始：" + str(exc)
             self._save(state)
-            url = (
-                self._config["issuer"]
-                + "/oauth/authorize?"
-                + urlencode(
-                    {
-                        "client_id": self._config["client_id"],
-                        "redirect_uri": pending["redirect_uri"],
-                        "response_type": "code",
-                        "scope": SCOPES,
-                        "state": pending["state"],
-                        "code_challenge": challenge(pending["verifier"]),
-                        "code_challenge_method": "S256",
-                    }
-                )
-            )
-            response = RedirectResponse(
-                url,
-                status_code=302,
-                headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
-            )
-            response.set_cookie(
-                self._cookie_name,
-                browser_secret,
-                httponly=True,
-                samesite="lax",
-                secure=self._config["mp_url"].startswith("https://"),
-                max_age=600,
-                path=self._api_path + "/oauth/callback",
-            )
-            return response
+            return
+        now = time.time()
+        state["pending"] = {
+            **device,
+            "expires_at": now + device["expires_in"],
+            "next_poll_at": now + device["interval"],
+        }
+        state["status"] = "等待确认，请打开插件详情查看授权链接与确认码"
+        self._save(state)
 
-    def oauth_callback(self, request: Request):
+    def _schedule_poll(self):
+        state = self._read()
+        pending = state.get("pending") or {}
+        if not pending.get("device_code") or not self._scheduler:
+            return
+        now = time.time()
+        if pending["expires_at"] <= now:
+            state.pop("pending", None)
+            state["status"] = "设备授权码已过期，请重新连接"
+            self._save(state)
+            return
+        if pending.get("in_flight"):
+            # Process may have stopped after exchange: never immediately replay on restart.
+            pending["interval"] = max(
+                pending["interval"], min(120, pending["interval"] * 2)
+            )
+            pending["next_poll_at"] = max(
+                pending["next_poll_at"], now + pending["interval"]
+            )
+            pending.pop("in_flight", None)
+            self._save(state)
+        self._scheduler.add_job(
+            self._poll_device,
+            trigger="date",
+            id="device_auth",
+            name="云盘设备授权确认",
+            replace_existing=True,
+            run_date=datetime.fromtimestamp(
+                min(pending["expires_at"], max(now + 1, pending["next_poll_at"])),
+                pytz.timezone(settings.TZ),
+            ),
+            args=[self._generation],
+            max_instances=1,
+            misfire_grace_time=600,
+        )
+
+    def _poll_device(self, generation):
         with self._lock:
+            if generation != self._generation:
+                return
             state = self._read()
             pending = state.get("pending") or {}
-            params = request.query_params
-            cookie = request.cookies.get(self._cookie_name, "")
-            valid = (
-                not self._config_error
-                and pending.get("started")
-                and cookie
-                and pending.get("expires_at", 0) > time.time()
-                and all(len(params.getlist(key)) == 1 for key in ("state", "iss"))
-                and all(len(params.getlist(key)) <= 1 for key in ("code", "error"))
-                and secrets.compare_digest(
-                    params.get("state", "").encode(), pending.get("state", "").encode()
-                )
-                and params.get("iss") == self._config["issuer"]
-                and secrets.compare_digest(
-                    hashlib.sha256(cookie.encode()).hexdigest(),
-                    pending.get("browser_hash", ""),
-                )
-            )
-            if not valid:
-                return self._html(
-                    "授权校验失败或已过期，请使用同一浏览器重新发起。", 400
-                )
-            state.pop("pending", None)
-            self._save(
-                state
-            )  # Consume locally before the one-shot token exchange, including on crashes.
-            if (
-                params.get("error")
-                or not params.get("code")
-                or len(params["code"]) > 1024
-            ):
-                state["status"] = "授权未完成；已有授权保持不变"
+            if not pending.get("device_code"):
+                return
+            now = time.time()
+            if now >= pending["expires_at"]:
+                state.pop("pending", None)
+                state["status"] = "设备授权码已过期，请重新连接"
                 self._save(state)
-                response = self._html("授权未完成，未更改已有账号。", 400)
-            else:
-                try:
-                    tokens = self._client().tokens(
-                        {
-                            "grant_type": "authorization_code",
-                            "code": params["code"],
-                            "redirect_uri": pending["redirect_uri"],
-                            "code_verifier": pending["verifier"],
-                        }
-                    )
-                    now = time.time()
-                    tokens["expires_at"] = now + tokens["expires_in"]
-                    # New grant: drop old identity/history before loading the newly authorized account.
-                    state = {
-                        "binding": state.get("binding"),
-                        "tokens": tokens,
-                        "grant_expires_at": now + 30 * 86400,
-                        "status": "授权成功，等待读取资料",
-                        "history": [],
+                return
+            if now < pending["next_poll_at"]:
+                self._schedule_poll()
+                return
+            pending["in_flight"] = True
+            pending["next_poll_at"] = now + pending["interval"]
+            self._save(state)
+            try:
+                tokens = self._client().tokens(
+                    {
+                        "grant_type": DEVICE_GRANT,
+                        "device_code": pending["device_code"],
                     }
-                    self._save(state)
-                    try:
-                        self._sync(state, tokens["access_token"])
-                        state["status"] = "已授权"
-                        self._save(state)
-                        message = "授权成功，已读取账号和签到资料。"
-                    except CloudError:
-                        message = (
-                            "授权成功；资料暂未读取，可在配置页选择“立即刷新资料”。"
-                        )
-                    response = self._html(message)
-                except CloudError:
-                    response = self._html(
-                        "令牌交换未成功或结果未知，请重新发起授权。", 400
+                )
+            except CloudError as exc:
+                pending.pop("in_flight", None)
+                if (
+                    exc.code in ("authorization_pending", "slow_down")
+                    and exc.status == 400
+                ):
+                    if exc.code == "slow_down":
+                        pending["interval"] += 5
+                    state["status"] = str(exc)
+                elif not exc.code and (
+                    exc.status == 0 or exc.status == 429 or exc.status >= 500
+                ):
+                    pending["interval"] = max(
+                        pending["interval"],
+                        min(120, pending["interval"] * 2),
+                        exc.retry_after,
                     )
-                    state["status"] = "本次授权交换未确认，请重新发起"
-                    self._save(state)
-            response.delete_cookie(
-                self._cookie_name, path=self._api_path + "/oauth/callback"
-            )
-            return response
+                    state["status"] = "授权查询暂未确认，已降低频率；请勿重复连接"
+                else:
+                    state.pop("pending", None)
+                    state["status"] = "连接已停止：" + str(exc)
+                pending["next_poll_at"] = time.time() + pending["interval"]
+                self._save(state)
+                self._schedule_poll()
+                return
+            now = time.time()
+            tokens["expires_at"] = now + tokens["expires_in"]
+            # Store a new grant before reading its identity. Persistence failures leave the
+            # old in-flight marker intact, never overwrite a successfully issued pair.
+            state = {
+                "binding": state.get("binding"),
+                "tokens": tokens,
+                "grant_expires_at": now + 30 * 86400,
+                "status": "授权成功，等待读取资料",
+                "history": [],
+            }
+            self._save(state)
+            try:
+                self._sync(state, tokens["access_token"])
+                state["status"] = "已授权"
+            except CloudError:
+                state["status"] = "授权成功；资料暂未读取，可选择立即刷新资料"
+            self._save(state)
 
     def _access(self, state, force=False):
         tokens = state.get("tokens") or {}
         if not tokens or state.get("blocked"):
-            raise CloudError("尚未授权或授权已停止，请在配置页生成授权链接")
+            raise CloudError("尚未授权或授权已停止，请在配置页连接账号")
         if state.get("refresh_in_flight"):
             raise CloudError("上次刷新结果未知，请重新授权；已停止重试旧刷新令牌")
         if state.get("grant_expires_at", 0) <= time.time():
@@ -548,29 +525,11 @@ class FCloudpanSign(_PluginBase):
         return []
 
     def get_api(self):
-        return [
-            {
-                "path": "/oauth/start",
-                "endpoint": self.oauth_start,
-                "methods": ["GET"],
-                "allow_anonymous": True,
-                "summary": "使用一次性入口开始云盘授权",
-            },
-            {
-                "path": "/oauth/callback",
-                "endpoint": self.oauth_callback,
-                "methods": ["GET"],
-                "allow_anonymous": True,
-                "summary": "云盘授权回调（校验 state、issuer、浏览器绑定与 PKCE）",
-            },
-        ]
+        return []
 
     def get_form(self):
         with self._lock:
-            return build_form(
-                self._config or self.DEFAULTS,
-                self._redirect_uri() if not self._config_error and self._config else "",
-            ), dict(self.DEFAULTS)
+            return build_form(self._config or self.DEFAULTS), dict(self.DEFAULTS)
 
     def get_page(self):
         with self._lock:
@@ -581,7 +540,10 @@ class FCloudpanSign(_PluginBase):
                     job.next_run_time.timestamp() if job and job.next_run_time else None
                 )
             return build_page(
-                self._read(), self._config, self._config_error, next_run, self._api_path
+                {} if self._config_error else self._read(),
+                self._config,
+                self._config_error,
+                next_run,
             )
 
     def stop_service(self):

@@ -1,6 +1,5 @@
 """Isolated MP storage + actual requests/FastAPI/scheduler contract tests."""
 
-import base64
 import copy
 import importlib.util
 import json
@@ -12,12 +11,10 @@ import types
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs
 
 import pytest
 import requests
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 
 class PluginBase:
@@ -74,6 +71,7 @@ for name, value in saved_modules.items():
 CloudError = plugin_module.CloudError
 CloudClient = plugin_module.CloudClient
 FCloudpanSign = plugin_module.FCloudpanSign
+SCHEDULER_START = plugin_module.BackgroundScheduler.start
 
 
 def pair(letter="a"):
@@ -128,6 +126,10 @@ class Upstream:
         self.nonjson = False
         self.redirect = False
         self.granted_scope = "account:read account:write"
+        self.device_error = ""
+        self.device_status = 400
+        self.device_override = {}
+        self.device_interval = 5
 
     def handle(self, method, path, headers, body):
         self.requests.append((method, path, dict(headers), body))
@@ -135,9 +137,28 @@ class Upstream:
             return 302, {"error": "redirect"}
         if self.nonjson:
             return 200, None
+        if path == "/oauth/device/code":
+            return 200, {
+                "device_code": "fco_device_" + "d" * 43,
+                "user_code": "ABCD-EFGH",
+                "verification_uri": self.issuer + "/oauth/device",
+                "verification_uri_complete": self.issuer
+                + "/oauth/device?user_code=ABCD-EFGH",
+                "expires_in": 600,
+                "interval": self.device_interval,
+                **self.device_override,
+            }
         if path == "/oauth/token":
             self.exchange_count += 1
             form = parse_qs(body)
+            if (
+                form.get("grant_type") == [plugin_module.DEVICE_GRANT]
+                and self.device_error
+            ):
+                return self.device_status, {
+                    "error": self.device_error,
+                    "error_description": "secret must never be logged",
+                }
             if form.get("grant_type") == ["refresh_token"] and self.fail_refresh:
                 return 500, {"error": "do not log upstream secret"}
             tokens = pair(chr(ord("a") + self.exchange_count))
@@ -221,9 +242,7 @@ def plugin(upstream, monkeypatch):
     config = {
         **instance.DEFAULTS,
         "issuer": upstream.issuer,
-        "mp_url": "https://mp.example",
         "client_id": "fixture:id",
-        "client_secret": "fixture/secret+value",
     }
     instance.init_plugin(config)
     yield instance
@@ -242,28 +261,16 @@ def authorize_locally(plugin, *, expired=False):
     plugin._save(state)
 
 
-def browser(plugin):
-    app = FastAPI()
-    for route in plugin.get_api():
-        route = dict(route)
-        route.pop("allow_anonymous")
-        route["path"] = plugin._api_path + route["path"]
-        app.add_api_route(**route)
-    return TestClient(app, base_url="https://mp.example", follow_redirects=False)
-
-
-def begin(plugin, client):
+def begin(plugin):
     plugin.init_plugin({**plugin._config, "prepare_auth": True})
-    pending = plugin._read()["pending"]
-    response = client.get(
-        plugin._api_path + "/oauth/start", params={"ticket": pending["ticket"]}
-    )
-    assert response.status_code == 302
-    return response, {
-        "state": pending["state"],
-        "iss": plugin._config["issuer"],
-        "code": "fixture-code",
-    }
+    return plugin._read()["pending"]
+
+
+def poll(plugin):
+    state = plugin._read()
+    state["pending"]["next_poll_at"] = time.time() - 1
+    plugin._save(state)
+    plugin._poll_device(plugin._generation)
 
 
 @pytest.mark.parametrize(
@@ -284,100 +291,162 @@ def test_rejects_unsafe_origins(url):
         plugin_module.origin_url(url)
 
 
-def test_pkce_rfc7636_vector():
-    assert (
-        plugin_module.challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")
-        == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-    )
+def test_public_device_roundtrip_has_no_secret_basic_or_callback(plugin, upstream):
+    pending = begin(plugin)
+    assert plugin.get_api() == []
+    assert plugin._scheduler.get_job("device_auth")
+    poll(plugin)
+    assert plugin._read()["account"]["sub"] == "42"
+    assert plugin._read()["overview"]["points"] == 100
+    assert not plugin._read().get("pending")
+    for request in upstream.requests[:2]:
+        assert "Authorization" not in request[2]
+        form = parse_qs(request[3])
+        assert form["client_id"] == ["fixture:id"]
+        assert "client_secret" not in form
+        assert "application/x-www-form-urlencoded" in request[2]["Content-Type"]
+    assert parse_qs(upstream.requests[0][3])["scope"] == ["account:read account:write"]
+    assert parse_qs(upstream.requests[1][3])["device_code"] == [pending["device_code"]]
+    assert not any(row[0:2] == ("POST", "/api/check-in") for row in upstream.requests)
+    plugin._poll_device(plugin._generation)
+    assert upstream.exchange_count == 1
 
 
-def test_oauth_roundtrip_checks_basic_pkce_and_private_cookie(plugin, upstream):
-    with browser(plugin) as client:
-        response, params = begin(plugin, client)
-        query = parse_qs(urlsplit(response.headers["location"]).query)
-        assert query["scope"] == ["account:read account:write"]
-        assert query["code_challenge_method"] == ["S256"]
-        assert "HttpOnly" in response.headers["set-cookie"]
-        assert "Secure" in response.headers["set-cookie"]
-        callback = client.get(plugin._api_path + "/oauth/callback", params=params)
-        assert callback.status_code == 200
-        assert callback.headers["cache-control"] == "no-store"
-        assert plugin._read()["account"]["sub"] == "42"
-        assert plugin._read()["overview"]["points"] == 100
-        token_request = upstream.requests[0]
-        credentials = base64.b64decode(token_request[2]["Authorization"][6:]).decode()
-        assert credentials == "fixture%3Aid:fixture%2Fsecret%2Bvalue"
-        form = parse_qs(token_request[3])
-        assert "application/x-www-form-urlencoded" in token_request[2]["Content-Type"]
-        assert query["code_challenge"] == [
-            plugin_module.challenge(form["code_verifier"][0])
-        ]
-        assert not any(
-            row[0] == "POST" and row[1] == "/api/check-in" for row in upstream.requests
-        )
-        assert (
-            client.get(plugin._api_path + "/oauth/callback", params=params).status_code
-            == 400
-        )
-        assert upstream.exchange_count == 1
+def test_pending_obeys_interval_and_resumes_after_reload(plugin, upstream):
+    begin(plugin)
+    plugin._poll_device(plugin._generation)
+    assert upstream.exchange_count == 0
+    upstream.device_error = "authorization_pending"
+    poll(plugin)
+    pending = plugin._read()["pending"]
+    assert pending["next_poll_at"] >= time.time() + 4
+    assert pending["interval"] == 5
+    plugin.init_plugin(plugin._config)
+    assert plugin._scheduler.get_job("device_auth")
+    plugin._poll_device(plugin._generation)
+    assert upstream.exchange_count == 1
+    assert len([r for r in upstream.requests if r[1] == "/oauth/device/code"]) == 1
+    upstream.device_error = ""
+    poll(plugin)
+    assert plugin._read()["tokens"]
+
+
+def test_slow_down_accumulates_five_seconds(plugin, upstream):
+    begin(plugin)
+    upstream.device_error = "slow_down"
+    for expected in (10, 15, 20):
+        poll(plugin)
+        pending = plugin._read()["pending"]
+        assert pending["interval"] == expected
+        assert pending["next_poll_at"] >= time.time() + expected - 1
+    assert not plugin._read().get("tokens")
+
+
+@pytest.mark.parametrize("status", [429, 500, 504])
+def test_device_server_failure_backs_off_without_new_code(plugin, upstream, status):
+    begin(plugin)
+    upstream.device_error, upstream.device_status = "server_error", status
+    for expected in (10, 20):
+        poll(plugin)
+        assert plugin._read()["pending"]["interval"] == expected
+    assert len([r for r in upstream.requests if r[1] == "/oauth/device/code"]) == 1
+    assert "secret must" not in json.dumps(plugin._read())
+
+
+def test_device_timeout_backs_off_without_exposing_exception(plugin, monkeypatch):
+    begin(plugin)
+
+    def fail(*args, **kwargs):
+        raise requests.Timeout("sensitive-device-code")
+
+    monkeypatch.setattr(requests.Session, "request", fail)
+    poll(plugin)
+    assert plugin._read()["pending"]["interval"] == 10
+    assert "sensitive-device-code" not in json.dumps(plugin._read())
 
 
 @pytest.mark.parametrize(
-    "attack", ["state", "issuer", "cookie", "duplicate", "expiry", "unicode"]
+    "code",
+    [
+        "access_denied",
+        "expired_token",
+        "invalid_grant",
+        "invalid_client",
+        "unauthorized_client",
+        "invalid_scope",
+    ],
 )
-def test_callback_rejects_forgery_without_exchange(plugin, upstream, attack):
-    with browser(plugin) as client:
-        _, params = begin(plugin, client)
-        if attack == "state":
-            params["state"] = "wrong"
-        elif attack == "issuer":
-            params["iss"] = "https://evil.example"
-        elif attack == "unicode":
-            params["state"] = "恶意参数"
-        elif attack == "cookie":
-            client.cookies.clear()
-        elif attack == "duplicate":
-            params["state"] = [params["state"], params["state"]]
-        else:
-            state = plugin._read()
-            state["pending"]["expires_at"] = 0
-            plugin._save(state)
-        assert (
-            client.get(plugin._api_path + "/oauth/callback", params=params).status_code
-            == 400
-        )
-        assert upstream.exchange_count == 0
-
-
-def test_user_denial_preserves_existing_grant(plugin, upstream):
+def test_terminal_device_error_stops_and_preserves_previous_grant(
+    plugin, upstream, code
+):
     authorize_locally(plugin)
     before = plugin._read()["tokens"]
-    with browser(plugin) as client:
-        _, params = begin(plugin, client)
-        params.pop("code")
-        params["error"] = "access_denied"
-        assert (
-            client.get(plugin._api_path + "/oauth/callback", params=params).status_code
-            == 400
-        )
+    begin(plugin)
+    upstream.device_error = code
+    poll(plugin)
+    assert not plugin._read().get("pending")
     assert plugin._read()["tokens"] == before
+    plugin.init_plugin(plugin._config)
+    assert not plugin._scheduler.get_jobs()
+    assert upstream.exchange_count == 1
+
+
+def test_expired_pending_and_cancel_never_poll_or_generate_new_code(plugin, upstream):
+    begin(plugin)
+    state = plugin._read()
+    state["pending"]["expires_at"] = 0
+    plugin._save(state)
+    plugin._poll_device(plugin._generation)
+    assert not plugin._read().get("pending")
+    assert upstream.exchange_count == 0
+    begin(plugin)
+    plugin.init_plugin({**plugin._config, "cancel_auth": True, "prepare_auth": True})
+    assert not plugin._read().get("pending")
+    assert not plugin._scheduler.get_jobs()
+    assert plugin.saved_config["cancel_auth"] is False
+    assert len(upstream.requests) == 2
+
+
+def test_reloaded_inflight_device_exchange_is_delayed(plugin, upstream):
+    begin(plugin)
+    state = plugin._read()
+    state["pending"].update(in_flight=True, next_poll_at=0)
+    plugin._save(state)
+    plugin.init_plugin(plugin._config)
+    assert plugin._read()["pending"]["interval"] == 10
+    plugin._poll_device(plugin._generation)
     assert upstream.exchange_count == 0
 
 
-def test_failed_code_exchange_is_never_replayed(plugin, upstream):
+@pytest.mark.parametrize(
+    "override",
+    [
+        {
+            "verification_uri_complete": "https://evil.example/oauth/device?user_code=ABCD"
+        },
+        {"verification_uri": "javascript:alert(1)"},
+        {"verification_uri": "https://name:pw@example.com/oauth/device"},
+        {"device_code": "short"},
+        {"user_code": "<script>"},
+        {"interval": False},
+        {"expires_in": 0},
+    ],
+)
+def test_rejects_malformed_or_cross_origin_device_response(plugin, upstream, override):
+    upstream.device_override = override
+    plugin.init_plugin({**plugin._config, "prepare_auth": True})
+    assert not plugin._read().get("pending")
+    assert not plugin._scheduler.get_jobs()
+
+
+def test_invalid_token_response_stops_device_exchange(plugin, upstream):
+    begin(plugin)
     upstream.granted_scope = "account:read"
-    with browser(plugin) as client:
-        _, params = begin(plugin, client)
-        assert (
-            client.get(plugin._api_path + "/oauth/callback", params=params).status_code
-            == 400
-        )
-        assert (
-            client.get(plugin._api_path + "/oauth/callback", params=params).status_code
-            == 400
-        )
-    assert upstream.exchange_count == 1
+    poll(plugin)
     assert not plugin._read().get("tokens")
+    assert not plugin._read().get("pending")
+    plugin._poll_device(plugin._generation)
+    assert upstream.exchange_count == 1
 
 
 def test_refresh_rotation_survives_reload_and_has_fixed_grant_expiry(plugin, upstream):
@@ -485,7 +554,7 @@ def test_account_mismatch_blocks_before_signin(plugin, upstream):
 def test_configuration_change_removes_other_identity(plugin):
     authorize_locally(plugin)
     plugin.run(sign=False)
-    plugin.init_plugin({**plugin._config, "client_secret": "new-fixture-secret"})
+    plugin.init_plugin({**plugin._config, "client_id": "new-public-id"})
     assert not plugin._read().get("tokens")
     assert not plugin._read().get("account")
     assert not plugin._read()["history"]
@@ -558,7 +627,8 @@ def test_ui_has_native_cards_and_no_secrets_or_network_calls(plugin, upstream):
     serialized = json.dumps([form, defaults, page], ensure_ascii=False)
     assert "VCard" in serialized and "近 14 日签到" in serialized
     assert "class-" not in serialized
-    assert plugin._config["client_secret"] not in serialized
+    assert "client_secret" not in serialized
+    assert "mp_url" not in serialized
     assert pair()["access_token"] not in serialized
     assert pair()["refresh_token"] not in serialized
     assert len(upstream.requests) == calls
@@ -618,12 +688,8 @@ def test_new_authorization_clears_previous_user_cache(plugin, upstream):
     plugin.run(sign=False)
     assert plugin._read()["history"]
     upstream.sub = "99"
-    with browser(plugin) as client:
-        _, params = begin(plugin, client)
-        assert (
-            client.get(plugin._api_path + "/oauth/callback", params=params).status_code
-            == 200
-        )
+    begin(plugin)
+    poll(plugin)
     assert plugin._read()["account"]["sub"] == "99"
     assert plugin._read()["history"] == []
 
@@ -637,3 +703,122 @@ def test_page_expiry_and_refresh_warning_override_stale_success(plugin):
     state.update(refresh_in_flight=True)
     plugin._save(state)
     assert "刷新结果未知" in json.dumps(plugin.get_page(), ensure_ascii=False)
+
+
+def test_upgrade_removes_legacy_secret_and_requires_public_authorization(plugin):
+    authorize_locally(plugin)
+    state = plugin._read()
+    state["binding"] = "legacy-confidential-binding"
+    state["pending"] = {"ticket": "old-ticket", "verifier": "old-verifier"}
+    plugin._save(state)
+    plugin.init_plugin(
+        {
+            **plugin._config,
+            "mp_url": "https://old.example",
+            "client_secret": "legacy-secret",
+        }
+    )
+    assert "client_secret" not in plugin.saved_config
+    assert "mp_url" not in plugin.saved_config
+    assert not plugin._read().get("tokens")
+    assert not plugin._read().get("pending")
+
+
+def test_pending_ui_only_exposes_user_code_and_authorization_link(plugin, upstream):
+    pending = begin(plugin)
+    calls = len(upstream.requests)
+    page = json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert pending["device_code"] not in page
+    assert pending["user_code"] in page
+    assert pending["verification_uri_complete"] in page
+    assert "data:image" not in page
+    assert len(upstream.requests) == calls
+
+
+def test_public_refresh_and_revoke_include_client_id_without_basic(plugin, upstream):
+    authorize_locally(plugin, expired=True)
+    assert plugin.run(sign=False)["success"]
+    plugin.init_plugin({**plugin._config, "revoke_auth": True})
+    for row in upstream.requests:
+        if row[1] in ("/oauth/token", "/oauth/revoke"):
+            assert "Authorization" not in row[2]
+            assert parse_qs(row[3])["client_id"] == ["fixture:id"]
+
+
+def test_device_exchange_stops_before_request_if_marker_cannot_be_saved(
+    plugin, upstream, monkeypatch
+):
+    begin(plugin)
+    state = plugin._read()
+    state["pending"]["next_poll_at"] = 0
+    plugin._save(state)
+
+    def failed_save(*args):
+        raise RuntimeError("sensitive SQL parameters")
+
+    monkeypatch.setattr(plugin, "save_data", failed_save)
+    with pytest.raises(CloudError):
+        plugin._poll_device(plugin._generation)
+    assert upstream.exchange_count == 0
+
+
+def test_live_scheduler_completes_pending_device_flow(plugin, upstream, monkeypatch):
+    monkeypatch.setattr(plugin_module.BackgroundScheduler, "start", SCHEDULER_START)
+    upstream.device_error = "authorization_pending"
+    begin(plugin)
+    deadline = time.monotonic() + 8
+    while upstream.exchange_count == 0 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert upstream.exchange_count == 1
+    upstream.device_error = ""
+    deadline = time.monotonic() + 8
+    while not plugin._read().get("tokens") and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert plugin._read().get("tokens")
+    assert upstream.exchange_count == 2
+    assert plugin._scheduler.get_job("device_auth") is None
+    assert not any(row[:2] == ("POST", "/api/check-in") for row in upstream.requests)
+
+
+def test_device_retry_after_is_respected(plugin, upstream, monkeypatch):
+    begin(plugin)
+    original = requests.Session.request
+
+    def limited(session, *args, **kwargs):
+        response = original(session, *args, **kwargs)
+        response.headers["Retry-After"] = "45"
+        return response
+
+    monkeypatch.setattr(requests.Session, "request", limited)
+    upstream.device_error, upstream.device_status = "server_error", 429
+    poll(plugin)
+    assert plugin._read()["pending"]["interval"] == 45
+    assert plugin._read()["pending"]["next_poll_at"] >= time.time() + 44
+
+
+def test_stale_device_job_does_not_touch_replacement_authorization(plugin, upstream):
+    begin(plugin)
+    generation = plugin._generation
+    plugin.init_plugin(plugin._config)
+    state = plugin._read()
+    state["pending"]["next_poll_at"] = 0
+    plugin._save(state)
+    plugin._poll_device(generation)
+    assert upstream.exchange_count == 0
+
+
+def test_invalid_configuration_hides_cached_identity(plugin):
+    authorize_locally(plugin)
+    plugin.run(sign=False)
+    plugin.init_plugin({**plugin._config, "issuer": "invalid"})
+    assert ACCOUNT["name"] not in json.dumps(plugin.get_page(), ensure_ascii=False)
+
+
+def test_device_code_never_enters_confirmation_link(plugin, upstream):
+    upstream.device_override = {
+        "verification_uri_complete": upstream.issuer
+        + "/oauth/device?device_code="
+        + "d" * 43
+    }
+    plugin.init_plugin({**plugin._config, "prepare_auth": True})
+    assert not plugin._read().get("pending")

@@ -2,7 +2,7 @@
 
 import time
 from datetime import datetime, timedelta
-from urllib.parse import urlencode, urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import pytz
 
@@ -113,7 +113,7 @@ def hero():
     )
 
 
-def build_form(config, redirect_uri):
+def build_form(config):
     return [
         node(
             "VForm",
@@ -177,7 +177,7 @@ def build_form(config, redirect_uri):
                     [
                         node(
                             "VAlert",
-                            "先在云盘后台 → 第三方应用注册此 MoviePilot 实例。仅勾选 account:read 与 account:write，并登记下方回调地址。",
+                            "使用站点提供的公共应用 Client ID 连接。无需应用密钥、MoviePilot 公网地址或回调配置，每位用户单独确认授权。",
                             type="info",
                             variant="tonal",
                             class_="mb-4",
@@ -194,9 +194,10 @@ def build_form(config, redirect_uri):
                                 ),
                                 column(
                                     field(
-                                        "mp_url",
-                                        "MoviePilot 浏览器访问根地址",
-                                        placeholder="https://你的MP域名",
+                                        "client_id",
+                                        "公共应用 Client ID",
+                                        hint="由云盘站点统一提供，可公开；不要填写 Secret",
+                                        persistent_hint=True,
                                     )
                                 ),
                             ],
@@ -204,33 +205,8 @@ def build_form(config, redirect_uri):
                         node(
                             "VRow",
                             content=[
-                                column(
-                                    field("client_id", "Client ID", autocomplete="off")
-                                ),
-                                column(
-                                    field(
-                                        "client_secret",
-                                        "Client Secret",
-                                        type="password",
-                                        autocomplete="new-password",
-                                    )
-                                ),
-                            ],
-                        ),
-                        node(
-                            "div",
-                            "回调地址："
-                            + (
-                                redirect_uri
-                                or "先保存站点与应用配置，重新打开配置页查看"
-                            ),
-                            class_="text-body-2 mb-3",
-                            style="overflow-wrap:anywhere",
-                        ),
-                        node(
-                            "VRow",
-                            content=[
-                                column(switch("prepare_auth", "保存后生成授权入口")),
+                                column(switch("prepare_auth", "保存后连接 / 重新授权")),
+                                column(switch("cancel_auth", "保存后取消本次连接")),
                                 column(
                                     switch(
                                         "revoke_auth",
@@ -242,7 +218,7 @@ def build_form(config, redirect_uri):
                         ),
                         node(
                             "VAlert",
-                            "生成后打开插件详情，点击“前往云盘授权”，在同一浏览器完成确认后自动返回。入口 10 分钟有效、仅用一次；30 天后需重新授权。",
+                            "保存后打开插件详情，点击授权链接，在云盘核对确认码并允许。无需返回 MP 的回调页面；后台会完成连接，重新打开详情查看结果。设备码通常 10 分钟有效；30 天后需重新授权。",
                             type="info",
                             variant="tonal",
                             class_="mt-2",
@@ -311,7 +287,7 @@ def build_form(config, redirect_uri):
     ]
 
 
-def build_page(state, config, config_error, next_run, api_path):
+def build_page(state, config, config_error, next_run):
     account = state.get("account") or {}
     overview = state.get("overview") or {}
     pending = state.get("pending") or {}
@@ -322,7 +298,7 @@ def build_page(state, config, config_error, next_run, api_path):
         and not state.get("refresh_in_flight")
         and state.get("grant_expires_at", 0) > now
     )
-    message = state.get("status", "请在配置页填写应用信息并生成授权入口")
+    message = state.get("status", "请在配置页填写公共应用信息并连接账号")
     if state.get("refresh_in_flight"):
         message = "上次令牌刷新结果未知，已停止重试，请重新授权"
     elif state.get("tokens") and state.get("grant_expires_at", 0) <= now:
@@ -337,42 +313,69 @@ def build_page(state, config, config_error, next_run, api_path):
             class_="mb-4",
         ),
     ]
-    if (
-        pending.get("ticket")
-        and not pending.get("started")
-        and pending.get("expires_at", 0) > now
-        and not config_error
-    ):
-        page.append(
-            section(
-                "连接你的云盘账号",
-                "mdi-shield-account-outline",
-                [
-                    node(
-                        "div",
-                        "在云盘确认授权后，将自动读取该账号资料。",
-                        class_="text-body-2 mb-3",
-                    ),
-                    node(
-                        "VBtn",
-                        "前往云盘授权",
-                        href=config["mp_url"]
-                        + api_path
-                        + "/oauth/start?"
-                        + urlencode({"ticket": pending["ticket"]}),
-                        target="_blank",
-                        rel="noopener noreferrer",
-                        color="primary",
-                        prepend_icon="mdi-open-in-new",
-                    ),
-                    node(
-                        "div",
-                        "入口有效至 " + stamp(pending["expires_at"]),
-                        class_="text-caption text-medium-emphasis mt-3",
-                    ),
-                ],
+    if pending.get("device_code") and not config_error:
+        if pending.get("expires_at", 0) > now:
+            link = (
+                pending.get("verification_uri_complete") or pending["verification_uri"]
             )
-        )
+            page.append(
+                section(
+                    "连接你的云盘账号",
+                    "mdi-shield-account-outline",
+                    [
+                        node(
+                            "div",
+                            "点击下方按钮，在 F-Cloudpan 登录，核对应用名称与确认码后点击允许。",
+                            class_="text-body-2 mb-3",
+                        ),
+                        node(
+                            "VBtn",
+                            "前往 F-Cloudpan 授权",
+                            href=link,
+                            target="_blank",
+                            rel="noopener noreferrer",
+                            color="primary",
+                            prepend_icon="mdi-open-in-new",
+                        ),
+                        node(
+                            "div",
+                            "请核对云盘页面中的确认码",
+                            class_="text-caption text-medium-emphasis mt-4",
+                        ),
+                        node(
+                            "div",
+                            pending["user_code"],
+                            class_="text-h5 font-weight-bold my-2",
+                            style="letter-spacing:0.12em;overflow-wrap:anywhere",
+                        ),
+                        node(
+                            "div",
+                            "也可访问 "
+                            + pending["verification_uri"]
+                            + " 并输入上方确认码。",
+                            class_="text-body-2 mt-3",
+                            style="overflow-wrap:anywhere",
+                        ),
+                        node(
+                            "div",
+                            "有效至 "
+                            + stamp(pending["expires_at"])
+                            + "；插件正在后台等待，完成后重新打开详情。取消请使用配置页的取消连接开关。",
+                            class_="text-caption text-medium-emphasis mt-3",
+                        ),
+                    ],
+                )
+            )
+        else:
+            page.append(
+                node(
+                    "VAlert",
+                    "本次设备授权码已过期，请在配置页重新连接。",
+                    type="warning",
+                    variant="tonal",
+                    class_="mb-4",
+                )
+            )
     if account:
         avatar = node("VIcon", "mdi-account-outline", size=34)
         asset = urljoin(
