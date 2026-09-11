@@ -15,6 +15,8 @@ from urllib.parse import parse_qs
 
 import pytest
 import requests
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.testclient import TestClient
 
 
 class PluginBase:
@@ -43,6 +45,8 @@ saved_modules = {
         "app",
         "app.core",
         "app.core.config",
+        "app.db",
+        "app.db.user_oper",
         "app.log",
         "app.plugins",
         "app.schemas",
@@ -51,6 +55,15 @@ saved_modules = {
 for name in saved_modules:
     sys.modules[name] = types.ModuleType(name)
 sys.modules["app.core.config"].settings = types.SimpleNamespace(TZ="Asia/Shanghai")
+
+
+def require_test_admin(authorization: str = Header("")):
+    # Boundary double for MoviePilot's existing active-superuser dependency.
+    if authorization != "Bearer fixture-admin":
+        raise HTTPException(403, "管理员登录必需")
+
+
+sys.modules["app.db.user_oper"].get_current_active_superuser = require_test_admin
 sys.modules["app.log"].logger = logging.getLogger("fcloud-test")
 sys.modules["app.plugins"]._PluginBase = PluginBase
 sys.modules["app.schemas"].NotificationType = types.SimpleNamespace(SiteMessage="site")
@@ -293,7 +306,7 @@ def test_rejects_unsafe_origins(url):
 
 def test_public_device_roundtrip_has_no_secret_basic_or_callback(plugin, upstream):
     pending = begin(plugin)
-    assert plugin.get_api() == []
+    assert [route["path"] for route in plugin.get_api()] == ["/action"]
     assert plugin._scheduler.get_job("device_auth")
     poll(plugin)
     assert plugin._read()["account"]["sub"] == "42"
@@ -576,6 +589,7 @@ def test_revoke_clears_state_and_failed_revoke_blocks(plugin, upstream):
 
 def test_disabled_and_oneshot_scheduling_preserve_config(plugin):
     assert plugin._scheduler.get_jobs() == []
+    authorize_locally(plugin)
     plugin.init_plugin({**plugin._config, "onlyonce": True, "notify": True})
     assert [job.id for job in plugin._scheduler.get_jobs()] == ["once"]
     assert plugin.saved_config["onlyonce"] is False
@@ -951,3 +965,269 @@ def test_zero_second_token_is_expired_and_stops_device_polling(plugin, upstream)
     assert not plugin._read().get("pending")
     assert "已到期" in plugin._read()["status"]
     assert not any(row[1] == "/oauth/account" for row in upstream.requests)
+
+
+@pytest.mark.parametrize("use_proxy", [True, False])
+def test_mp_proxy_is_explicit_and_ambient_credentials_stay_disabled(
+    plugin, upstream, monkeypatch, use_proxy
+):
+    configured = {"http": upstream.issuer, "https": upstream.issuer}
+    monkeypatch.setattr(plugin_module.settings, "PROXY", configured, raising=False)
+    plugin._config["use_proxy"] = use_proxy
+    seen = []
+    original = requests.Session.request
+
+    def capture(session, *args, **kwargs):
+        seen.append((session.trust_env, kwargs.get("proxies")))
+        # Test the real protocol against the fixture after checking proxy forwarding.
+        kwargs["proxies"] = {}
+        return original(session, *args, **kwargs)
+
+    monkeypatch.setattr(requests.Session, "request", capture)
+    plugin._client().device_authorization()
+    assert seen == [(False, configured if use_proxy else {})]
+
+
+@pytest.mark.parametrize(
+    "exception, expected",
+    [
+        (requests.exceptions.ProxyError, "连接代理失败"),
+        (requests.exceptions.SSLError, "TLS 握手或证书校验失败"),
+        (requests.exceptions.ConnectTimeout, "建立连接超时"),
+        (requests.exceptions.ReadTimeout, "等待云盘响应超时"),
+        (requests.exceptions.ConnectionError, "云盘连接中断"),
+    ],
+)
+def test_network_errors_are_actionable_without_leaking_credentials(
+    plugin, monkeypatch, exception, expected
+):
+    secret = "http://user:private-proxy-password@proxy.invalid/token"
+
+    def fail(*args, **kwargs):
+        raise exception(secret)
+
+    monkeypatch.setattr(requests.Session, "request", fail)
+    with pytest.raises(CloudError) as caught:
+        plugin._client().device_authorization()
+    assert expected in str(caught.value)
+    assert "直连" in str(caught.value)
+    assert "private-proxy-password" not in str(caught.value)
+    assert secret not in str(caught.value)
+
+
+def test_dns_error_is_classified_through_wrapped_causes(plugin, monkeypatch):
+    import socket
+
+    from urllib3.exceptions import MaxRetryError, NewConnectionError
+
+    def fail(*args, **kwargs):
+        dns = socket.gaierror(-2, "secret-hostname")
+        connection = NewConnectionError(None, "secret-connection")
+        connection.__cause__ = dns
+        raise requests.ConnectionError(MaxRetryError(None, "secret-url", connection))
+
+    monkeypatch.setattr(requests.Session, "request", fail)
+    with pytest.raises(CloudError, match="DNS 域名解析失败") as caught:
+        plugin._client().device_authorization()
+    assert "secret" not in str(caught.value)
+
+
+def test_form_exposes_pending_link_before_run_settings_without_secrets(
+    plugin, upstream
+):
+    pending = begin(plugin)
+    calls = len(upstream.requests)
+    form, defaults = plugin.get_form()
+    serialized = json.dumps(form, ensure_ascii=False)
+    assert pending["verification_uri_complete"] in serialized
+    assert pending["user_code"] in serialized
+    assert pending["device_code"] not in serialized
+    assert "运行设置" not in serialized
+    assert serialized.index("前往 F-Cloudpan 授权") < serialized.index("网络设置")
+    assert defaults["use_proxy"] is True
+    assert len(upstream.requests) == calls
+    state = plugin._read()
+    state["pending"]["expires_at"] = time.time() - 1
+    plugin._save(state)
+    expired = json.dumps(plugin.get_form(), ensure_ascii=False)
+    assert pending["verification_uri_complete"] not in expired
+    assert "已过期" in expired
+
+
+def test_form_reports_failed_connection_without_creating_device_code(
+    plugin, monkeypatch
+):
+    def fail(*args, **kwargs):
+        raise requests.exceptions.ProxyError("sensitive-proxy-password")
+
+    monkeypatch.setattr(requests.Session, "request", fail)
+    plugin.init_plugin({**plugin._config, "prepare_auth": True})
+    serialized = json.dumps(plugin.get_form(), ensure_ascii=False)
+    assert "连接未开始" in serialized
+    assert "连接代理失败" in serialized
+    assert "sensitive-proxy-password" not in serialized
+    assert "前往 F-Cloudpan 授权" not in serialized.replace(
+        "“前往 F-Cloudpan 授权”", ""
+    )
+
+
+def test_upgrade_persists_proxy_default_for_mp_saved_form(plugin):
+    old_config = {k: v for k, v in plugin._config.items() if k != "use_proxy"}
+    plugin.init_plugin(old_config)
+    assert plugin.saved_config["use_proxy"] is True
+    plugin.init_plugin({**old_config, "use_proxy": False})
+    assert plugin._config["use_proxy"] is False
+
+
+@pytest.fixture
+def action_api(plugin):
+    app = FastAPI()
+    for route in plugin.get_api():
+        assert route.pop("auth") == "bear"
+        assert route["dependencies"][0].dependency is require_test_admin
+        app.add_api_route(**route)
+    with TestClient(app) as client:
+        yield client
+
+
+def test_action_api_requires_admin_and_post(action_api, upstream):
+    for headers in ({}, {"Authorization": "Bearer fixture-nonadmin"}):
+        response = action_api.post(
+            "/action", json={"action": "connect"}, headers=headers
+        )
+        assert response.status_code == 403
+    assert action_api.get("/action").status_code == 405
+    assert not upstream.requests
+
+
+def test_connect_button_is_immediate_and_repeated_click_keeps_code(
+    action_api, plugin, upstream
+):
+    headers = {"Authorization": "Bearer fixture-admin"}
+    first = action_api.post("/action", json={"action": "connect"}, headers=headers)
+    assert first.status_code == 200 and first.json()["success"]
+    pending = plugin._read()["pending"]
+    second = action_api.post("/action", json={"action": "connect"}, headers=headers)
+    assert second.json()["success"]
+    assert plugin._read()["pending"]["device_code"] == pending["device_code"]
+    assert len(upstream.requests) == 1
+    assert "device_code" not in first.text and "fco_device_" not in first.text
+    assert plugin.saved_config["prepare_auth"] is False
+
+
+def test_cancel_button_preserves_connected_account(action_api, plugin):
+    authorize_locally(plugin)
+    begin(plugin)
+    tokens = plugin._read()["tokens"]
+    response = action_api.post(
+        "/action",
+        json={"action": "cancel"},
+        headers={"Authorization": "Bearer fixture-admin"},
+    )
+    assert response.json()["success"]
+    assert not plugin._read().get("pending")
+    assert plugin._read()["tokens"] == tokens
+
+
+def test_revoke_button_requires_confirmation_and_handles_network_failure(
+    action_api, plugin, upstream
+):
+    authorize_locally(plugin)
+    headers = {"Authorization": "Bearer fixture-admin"}
+    response = action_api.post("/action", json={"action": "revoke"}, headers=headers)
+    assert response.status_code == 400
+    assert not upstream.requests
+    upstream.fail_revoke = True
+    response = action_api.post(
+        "/action", json={"action": "revoke", "confirmed": True}, headers=headers
+    )
+    assert not response.json()["success"]
+    assert plugin._read()["tokens"] and plugin._read()["blocked"]
+    assert "撤销未确认" in response.json()["status"]
+    upstream.fail_revoke = False
+    response = action_api.post(
+        "/action", json={"action": "revoke", "confirmed": True}, headers=headers
+    )
+    assert response.json()["success"]
+    assert not plugin._read().get("tokens")
+    calls = len(upstream.requests)
+    action_api.post(
+        "/action", json={"action": "revoke", "confirmed": True}, headers=headers
+    )
+    assert len(upstream.requests) == calls
+
+
+def test_action_buttons_have_no_form_switches_and_only_offer_valid_actions(plugin):
+    def actions(value):
+        if isinstance(value, dict):
+            if "events" in value:
+                yield value["events"]["click"]["params"]["action"]
+            for child in value.values():
+                yield from actions(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from actions(child)
+
+    assert list(actions(plugin.get_page())) == ["connect"]
+    authorize_locally(plugin)
+    begin(plugin)
+    assert list(actions(plugin.get_page())) == ["connect", "cancel", "revoke"]
+    form = json.dumps(plugin.get_form()[0], ensure_ascii=False)
+    assert '"model": "cancel_auth"' not in form
+    assert '"model": "revoke_auth"' not in form
+    assert '"events"' not in form
+    assert "查看数据" in form
+
+
+@pytest.mark.parametrize(
+    "condition", ["missing", "expired", "blocked", "refresh_unknown"]
+)
+def test_unavailable_authorization_only_shows_connection_and_network(
+    plugin, upstream, condition
+):
+    if condition != "missing":
+        authorize_locally(plugin)
+        state = plugin._read()
+        if condition == "expired":
+            state["grant_expires_at"] = time.time() - 1
+        elif condition == "blocked":
+            state["blocked"] = True
+        else:
+            state["refresh_in_flight"] = True
+        plugin._save(state)
+    plugin.init_plugin(
+        {**plugin._config, "enabled": True, "onlyonce": True, "cron": "15 8 * * *"}
+    )
+    assert not plugin.get_state()
+    assert not plugin._scheduler.get_jobs()
+    assert plugin.saved_config["cron"] == "15 8 * * *"
+    assert plugin.saved_config["enabled"] is True
+    form = json.dumps(plugin.get_form()[0], ensure_ascii=False)
+    assert "网络设置" in form and '"model": "timeout"' in form
+    for name in (
+        "enabled",
+        "mode",
+        "cron",
+        "onlyonce",
+        "refresh_now",
+        "notify",
+        "jitter",
+        "history_days",
+    ):
+        assert f'"model": "{name}"' not in form
+    calls = len(upstream.requests)
+    plugin._scheduled(plugin._generation, True)
+    assert len(upstream.requests) == calls
+    assert not plugin.messages
+
+
+def test_authorization_success_restores_saved_schedule_and_form(plugin, upstream):
+    plugin.init_plugin({**plugin._config, "enabled": True, "cron": "15 8 * * *"})
+    assert not plugin.get_state() and not plugin._scheduler.get_jobs()
+    begin(plugin)
+    poll(plugin)
+    assert plugin.get_state()
+    assert plugin._scheduler.get_job("daily") is not None
+    assert plugin._config["cron"] == "15 8 * * *"
+    assert "运行设置" in json.dumps(plugin.get_form()[0], ensure_ascii=False)
+    assert not any(row[:2] == ("POST", "/api/check-in") for row in upstream.requests)

@@ -6,25 +6,27 @@ import secrets
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 import pytz
 from app.core.config import settings
+from app.db.user_oper import get_current_active_superuser
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import NotificationType
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from fastapi import Body, Depends, HTTPException
 
 from .client import DEVICE_GRANT, CloudClient, CloudError, origin_url
-from .ui import build_form, build_page
+from .ui import authorization_ready, build_form, build_page
 
 
 class FCloudpanSign(_PluginBase):
     plugin_name = "F-Cloudpan 签到"
     plugin_desc = "通过应用授权自动签到，读取积分、VIP 与签到记录"
     plugin_icon = "https://raw.githubusercontent.com/liuyunfz/MoviePilot-Plugins/main/icons/fcloudpansign.png"
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     plugin_author = "liuyunfz"
     author_url = "https://github.com/liuyunfz"
     plugin_config_prefix = "fcloudpansign_"
@@ -44,6 +46,7 @@ class FCloudpanSign(_PluginBase):
     _client_id = ""
     DEFAULTS: ClassVar[dict] = {
         "enabled": False,
+        "use_proxy": True,
         "notify": False,
         "onlyonce": False,
         "refresh_now": False,
@@ -78,6 +81,9 @@ class FCloudpanSign(_PluginBase):
             self._issuer,
             self._client_id,
             self._config["timeout"],
+            proxies=getattr(settings, "PROXY", None)
+            if self._config.get("use_proxy", True)
+            else None,
         )
 
     def init_plugin(self, config=None):
@@ -131,9 +137,13 @@ class FCloudpanSign(_PluginBase):
             # One-shot settings are reset before any network call or scheduling.
             for key in actions:
                 self._config[key] = False
-            if actions or any(
-                key in (config or {})
-                for key in ("mp_url", "client_secret", "issuer", "client_id")
+            if (
+                actions
+                or "use_proxy" not in (config or {})
+                or any(
+                    key in (config or {})
+                    for key in ("mp_url", "client_secret", "issuer", "client_id")
+                )
             ):
                 self.update_config(dict(self._config))
             if self._config_error:
@@ -172,27 +182,10 @@ class FCloudpanSign(_PluginBase):
 
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
             self._schedule_poll()
-            if self._config["enabled"]:
-                try:
-                    trigger = CronTrigger.from_crontab(
-                        self._config["cron"], timezone=settings.TZ
-                    )
-                    trigger.jitter = self._config["jitter"]
-                    self._scheduler.add_job(
-                        self._scheduled,
-                        trigger=trigger,
-                        id="daily",
-                        name=self.plugin_name,
-                        args=[self._generation, True],
-                        max_instances=1,
-                        coalesce=True,
-                        misfire_grace_time=600,
-                    )
-                except (ValueError, TypeError):
-                    state = self._read()
-                    state["status"] = "Cron 表达式无效，定时任务未启动"
-                    self._save(state)
-            if "onlyonce" in actions or "refresh_now" in actions:
+            self._schedule_daily()
+            if authorization_ready(self._read()) and (
+                "onlyonce" in actions or "refresh_now" in actions
+            ):
                 self._scheduler.add_job(
                     self._scheduled,
                     trigger="date",
@@ -206,9 +199,34 @@ class FCloudpanSign(_PluginBase):
             if self._scheduler.get_jobs():
                 self._scheduler.start()
 
+    def _schedule_daily(self):
+        if not self._scheduler or not authorization_ready(self._read()):
+            return
+        if self._config["enabled"]:
+            try:
+                trigger = CronTrigger.from_crontab(
+                    self._config["cron"], timezone=settings.TZ
+                )
+                trigger.jitter = self._config["jitter"]
+                self._scheduler.add_job(
+                    self._scheduled,
+                    trigger=trigger,
+                    id="daily",
+                    replace_existing=True,
+                    name=self.plugin_name,
+                    args=[self._generation, True],
+                    max_instances=1,
+                    coalesce=True,
+                    misfire_grace_time=600,
+                )
+            except (ValueError, TypeError):
+                state = self._read()
+                state["status"] = "Cron 表达式无效，定时任务未启动"
+                self._save(state)
+
     def _scheduled(self, generation, sign):
         with self._lock:
-            if generation != self._generation:
+            if generation != self._generation or not authorization_ready(self._read()):
                 return
             self.run(sign=sign)
 
@@ -248,7 +266,7 @@ class FCloudpanSign(_PluginBase):
             "expires_at": now + device["expires_in"],
             "next_poll_at": now + device["interval"],
         }
-        state["status"] = "等待确认，请打开插件详情查看授权链接与确认码"
+        state["status"] = "等待确认，请在当前数据页或重新打开设置页查看授权链接与确认码"
         self._save(state)
 
     def _schedule_poll(self):
@@ -358,6 +376,7 @@ class FCloudpanSign(_PluginBase):
             except CloudError:
                 state["status"] = "授权成功；资料暂未读取，可选择立即刷新资料"
             self._save(state)
+            self._schedule_daily()
 
     def _access(self, state, force=False):
         tokens = state.get("tokens") or {}
@@ -533,7 +552,10 @@ class FCloudpanSign(_PluginBase):
             }
 
     def get_state(self):
-        return bool(self._config.get("enabled"))
+        with self._lock:
+            return bool(self._config.get("enabled")) and authorization_ready(
+                self._read()
+            )
 
     @staticmethod
     def get_command():
@@ -543,12 +565,75 @@ class FCloudpanSign(_PluginBase):
         return []
 
     def get_api(self):
-        return []
+        return [
+            {
+                "path": "/action",
+                "endpoint": self.action,
+                "methods": ["POST"],
+                "summary": "F-Cloudpan 连接管理",
+                "auth": "bear",
+                "dependencies": [Depends(get_current_active_superuser)],
+            }
+        ]
+
+    def action(
+        self,
+        action: Literal["connect", "cancel", "revoke"] = Body(..., embed=True),
+        confirmed: bool = Body(False),
+    ):
+        with self._lock:
+            if self._config_error:
+                raise HTTPException(400, self._config_error)
+            if action == "revoke" and confirmed is not True:
+                raise HTTPException(400, "请先确认断开本设备授权")
+            try:
+                state = self._read()
+                pending = state.get("pending") or {}
+                # Repeated clicks must not replace a live code or revoke twice.
+                if action == "connect" and pending.get("expires_at", 0) > time.time():
+                    return {"success": True, "status": state.get("status", "等待确认")}
+                if action == "cancel" and not pending:
+                    return {
+                        "success": True,
+                        "status": state.get("status", "没有待取消的连接"),
+                    }
+                if action == "revoke" and not state.get("tokens") and not pending:
+                    return {"success": True, "status": "本设备未连接"}
+                config = {**self._config}
+                for key in (
+                    "prepare_auth",
+                    "cancel_auth",
+                    "revoke_auth",
+                    "onlyonce",
+                    "refresh_now",
+                ):
+                    config[key] = False
+                config[
+                    {
+                        "connect": "prepare_auth",
+                        "cancel": "cancel_auth",
+                        "revoke": "revoke_auth",
+                    }[action]
+                ] = True
+                self.init_plugin(config)
+                state = self._read()
+                success = (
+                    bool(state.get("pending"))
+                    if action == "connect"
+                    else not state.get("pending")
+                    if action == "cancel"
+                    else not state.get("tokens")
+                )
+                return {"success": success, "status": state.get("status", "")}
+            except CloudError as exc:
+                raise HTTPException(503, str(exc)) from None
 
     def get_form(self):
         with self._lock:
             return build_form(
-                bool(self.FCLOUDPAN_ORIGIN and self.OAUTH_CLIENT_ID)
+                bool(self.FCLOUDPAN_ORIGIN and self.OAUTH_CLIENT_ID),
+                {} if self._config_error else self._read(),
+                self._config_error,
             ), dict(self.DEFAULTS)
 
     def get_page(self):

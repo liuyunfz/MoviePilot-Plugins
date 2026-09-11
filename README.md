@@ -9,7 +9,7 @@
 | PT 自动任务 | `PTAutoTask` | 1.2.0 | 多站点签到、喊话、领取任务与福利，按站点汇总结果 | [配置与开发](doc/ptautotask.md) |
 | CD2 Webhook 通知 CMS | `CloudDrive2Webhook` | 1.1.1 | 命中文件事件后通知 CMS，整理中可跳过 | [Webhook 接入](doc/clouddrive2webhook.md) |
 | NodeSeek 签到 | `NodeSeekSign` | 1.2.1 | NodeSeek 签到，支持浏览器会话及旧配置迁移 | [配置说明](doc/nodeseeksign.md) |
-| F-Cloudpan 签到 | `FCloudpanSign` | 1.1.1 | 内置官方应用、直接授权、自动签到与积分/VIP 记录 | [应用授权指南](doc/fcloudpansign.md) |
+| F-Cloudpan 签到 | `FCloudpanSign` | 1.1.2 | 内置官方应用、直接授权、自动签到与积分/VIP 记录 | [应用授权指南](doc/fcloudpansign.md) |
 
 ## 安装与更新
 

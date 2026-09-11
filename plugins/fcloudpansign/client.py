@@ -3,6 +3,7 @@
 import ipaddress
 import math
 import re
+import socket
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import requests
@@ -75,16 +76,48 @@ def number(value):
     )
 
 
+def network_error(exc):
+    """Classify without rendering exception strings, URLs or proxy credentials."""
+    if isinstance(exc, requests.exceptions.ProxyError):
+        return "连接代理失败"
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "TLS 握手或证书校验失败"
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return "建立连接超时"
+    if isinstance(exc, requests.exceptions.ReadTimeout):
+        return "等待云盘响应超时"
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "云盘请求超时"
+    # requests wraps urllib3 errors, which may wrap the socket resolver error.
+    seen = set()
+    pending = [exc]
+    while pending and len(seen) < 32:
+        error = pending.pop()
+        if not isinstance(error, BaseException) or id(error) in seen:
+            continue
+        seen.add(id(error))
+        if isinstance(error, socket.gaierror):
+            return "DNS 域名解析失败"
+        pending.extend(error.args)
+        pending.extend(
+            [error.__cause__, error.__context__, getattr(error, "reason", None)]
+        )
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "云盘连接中断或无法建立连接"
+    return "云盘网络请求失败"
+
+
 class CloudClient:
-    def __init__(self, issuer, client_id, timeout=20):
+    def __init__(self, issuer, client_id, timeout=20, proxies=None):
         self.issuer = origin_url(issuer)
         self.client_id = client_id
         self.timeout = timeout
+        self.proxies = dict(proxies) if proxies else {}
 
     def request(self, method, path, *, token=None, form=None, payload=None):
         headers = {
             "Accept": "application/json",
-            "User-Agent": "MoviePilot-FCloudpanSign/1.1.1",
+            "User-Agent": "MoviePilot-FCloudpanSign/1.1.2",
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -102,6 +135,7 @@ class CloudClient:
                     json=payload,
                     timeout=(5, self.timeout),
                     allow_redirects=False,
+                    proxies=self.proxies,
                 ) as response:
                     status = response.status_code
                     if not 200 <= status < 300:
@@ -148,8 +182,12 @@ class CloudClient:
                             "云盘未返回有效 JSON，请检查站点地址和反向代理",
                             code="invalid_response",
                         ) from None
-        except requests.RequestException:
-            raise CloudError("云盘连接失败或超时，本次请求结果未知") from None
+        except requests.RequestException as exc:
+            route = "MoviePilot 代理" if self.proxies else "直连"
+            reason = network_error(exc)
+            raise CloudError(
+                f"{reason}（{route}）；请检查 NAS / 容器网络及 MP 代理设置，本次请求结果未知"
+            ) from None
         if not isinstance(result, dict):
             raise CloudError("云盘响应格式不正确", code="invalid_response")
         return result

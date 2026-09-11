@@ -103,13 +103,13 @@ def hero():
                 "VCardText",
                 content=[
                     node(
-                        "VImg",
+                        "img",
                         src=brand_icon(),
                         alt="F-Cloudpan · Telegram 同款图标",
                         width=64,
                         height=64,
                         class_="mx-auto mb-3 rounded-xl",
-                        eager=True,
+                        style="display:block;object-fit:contain",
                     ),
                     node("div", "F-Cloudpan", class_="text-h5 font-weight-bold"),
                     node(
@@ -128,12 +128,88 @@ def hero():
     )
 
 
-def build_form(application_ready=True):
-    return [
-        node(
-            "VForm",
-            content=[
-                hero(),
+def authorization_ready(state):
+    deadline = state.get("grant_expires_at")
+    return (
+        bool(state.get("tokens"))
+        and not state.get("blocked")
+        and not state.get("refresh_in_flight")
+        and (deadline is None or deadline > time.time())
+    )
+
+
+def build_form(application_ready=True, state=None, config_error=""):
+    state = state or {}
+    ready = application_ready and not config_error and authorization_ready(state)
+    sections = [
+        hero(),
+        section(
+            "应用授权",
+            "mdi-shield-key-outline",
+            [
+                *connection_cards(state, config_error),
+                node(
+                    "VAlert",
+                    "插件已内置官方站点和应用。请先连接账号，授权成功后重新打开设置页，即可配置签到。已有签到设置会保留。"
+                    if not ready
+                    else "账号已连接。可调整签到设置，或在“查看数据”中管理本设备授权。",
+                    type="info",
+                    variant="tonal",
+                    class_="mb-4",
+                ),
+                *(
+                    []
+                    if application_ready
+                    else [
+                        node(
+                            "VAlert",
+                            "正式应用配置尚未就绪，连接暂不可用。",
+                            type="warning",
+                            variant="tonal",
+                        )
+                    ]
+                ),
+                switch(
+                    "prepare_auth",
+                    "保存后连接 / 重新授权",
+                    disabled=not application_ready,
+                ),
+                node(
+                    "div",
+                    "推荐点击底部“查看数据”→“连接云盘账号”，随后点击“前往 F-Cloudpan 授权”。也可打开上方开关并保存，再打开本页获取授权链接。",
+                    class_="text-body-2 mt-2",
+                ),
+                node(
+                    "div",
+                    "取消连接、断开本设备授权均在“查看数据”中点击按钮立即执行，无需保存。",
+                    class_="text-caption text-medium-emphasis mt-2",
+                ),
+            ],
+        ),
+        section(
+            "网络设置",
+            "mdi-network-outline",
+            [
+                switch(
+                    "use_proxy",
+                    "使用 MoviePilot 网络代理",
+                    hint="默认开启；未配置 MP 代理时直连。修改后点击保存生效。",
+                    persistent_hint=True,
+                ),
+                field(
+                    "timeout",
+                    "请求超时（秒）",
+                    type="number",
+                    min=5,
+                    max=60,
+                    class_="mt-4",
+                ),
+            ],
+        ),
+    ]
+    if ready:
+        sections.extend(
+            [
                 section(
                     "运行设置",
                     "mdi-calendar-clock",
@@ -186,59 +262,6 @@ def build_form(application_ready=True):
                         ),
                     ],
                 ),
-                section(
-                    "应用授权",
-                    "mdi-shield-key-outline",
-                    [
-                        node(
-                            "VAlert",
-                            "插件已内置 F-Cloudpan 站点与“MoviePilot 签到助手”应用。你只需登录自己的云盘账号并确认授权，无需填写站点地址或应用信息。",
-                            type="info",
-                            variant="tonal",
-                            class_="mb-4",
-                        ),
-                        *(
-                            []
-                            if application_ready
-                            else [
-                                node(
-                                    "VAlert",
-                                    "此本地开发版本还在等待正式应用配置，连接暂不可用。",
-                                    type="warning",
-                                    variant="tonal",
-                                    class_="mb-4",
-                                )
-                            ]
-                        ),
-                        node(
-                            "VRow",
-                            content=[
-                                column(
-                                    switch(
-                                        "prepare_auth",
-                                        "保存后连接 / 重新授权",
-                                        disabled=not application_ready,
-                                    )
-                                ),
-                                column(switch("cancel_auth", "保存后取消本次连接")),
-                                column(
-                                    switch(
-                                        "revoke_auth",
-                                        "保存后断开本设备授权",
-                                        color="error",
-                                    )
-                                ),
-                            ],
-                        ),
-                        node(
-                            "VAlert",
-                            "保存后打开插件详情，点击授权链接，在云盘核对确认码并允许。无需返回 MP 的回调页面；后台会完成连接，重新打开详情查看结果。确认码通常 10 分钟有效。同一用户的各设备共用应用授权期限（最长 30 天），新增设备不延期。",
-                            type="info",
-                            variant="tonal",
-                            class_="mt-2",
-                        ),
-                    ],
-                ),
                 node(
                     "VExpansionPanels",
                     content=[
@@ -259,18 +282,7 @@ def build_form(application_ready=True):
                                                         type="number",
                                                         min=0,
                                                         max=1800,
-                                                    ),
-                                                    4,
-                                                ),
-                                                column(
-                                                    field(
-                                                        "timeout",
-                                                        "请求超时（秒）",
-                                                        type="number",
-                                                        min=5,
-                                                        max=60,
-                                                    ),
-                                                    4,
+                                                    )
                                                 ),
                                                 column(
                                                     field(
@@ -279,8 +291,7 @@ def build_form(application_ready=True):
                                                         type="number",
                                                         min=1,
                                                         max=365,
-                                                    ),
-                                                    4,
+                                                    )
                                                 ),
                                             ],
                                         ),
@@ -296,30 +307,25 @@ def build_form(application_ready=True):
                     ],
                     class_="mb-4",
                 ),
-            ],
+            ]
         )
-    ]
+    return [node("VForm", content=sections)]
 
 
-def build_page(state, issuer, config_error, next_run):
-    account = state.get("account") or {}
-    overview = state.get("overview") or {}
+def connection_cards(state, config_error=""):
     pending = state.get("pending") or {}
     now = time.time()
     deadline = state.get("grant_expires_at")
-    ready = (
-        bool(state.get("tokens"))
-        and not state.get("blocked")
-        and not state.get("refresh_in_flight")
-        and (deadline is None or deadline > now)
+    ready = authorization_ready(state)
+    message = state.get(
+        "status",
+        "在设置页打开“保存后连接 / 重新授权”并点击“保存”，再打开设置页获取授权链接",
     )
-    message = state.get("status", "请在配置页选择连接账号并保存")
     if state.get("refresh_in_flight"):
         message = "上次令牌刷新结果未知，已停止重试，请重新授权"
     elif state.get("tokens") and deadline is not None and deadline <= now:
         message = "应用授权已到期，请重新授权"
     page = [
-        hero(),
         node(
             "VAlert",
             config_error or message,
@@ -375,7 +381,7 @@ def build_page(state, issuer, config_error, next_run):
                             "div",
                             "有效至 "
                             + stamp(pending["expires_at"])
-                            + "；插件正在后台等待，完成后重新打开详情。取消请使用配置页的取消连接开关。",
+                            + "；插件正在后台等待，完成后重新打开详情。取消连接请使用“查看数据”页的按钮。",
                             class_="text-caption text-medium-emphasis mt-3",
                         ),
                     ],
@@ -391,6 +397,104 @@ def build_page(state, issuer, config_error, next_run):
                     class_="mb-4",
                 )
             )
+    return page
+
+
+def action_button(label, action, *, confirmed=False, **props):
+    button = node("VBtn", label, **props)
+    button["events"] = {
+        "click": {
+            "api": "plugin/FCloudpanSign/action",
+            "method": "POST",
+            "params": {"action": action, "confirmed": confirmed},
+        }
+    }
+    return button
+
+
+def connection_actions(state):
+    pending = bool(state.get("pending"))
+    waiting = (state.get("pending") or {}).get("expires_at", 0) > time.time()
+    connected = bool(state.get("tokens"))
+    controls = [
+        node(
+            "div",
+            "按钮点击后立即执行并刷新本页，无需保存设置。网络代理和超时使用已保存的配置。",
+            class_="text-body-2 mb-3",
+        ),
+        node(
+            "div",
+            content=[
+                action_button(
+                    "重新连接账号" if connected else "连接云盘账号",
+                    "connect",
+                    color="primary",
+                    disabled=waiting,
+                    prepend_icon="mdi-link-variant",
+                ),
+                *(
+                    [
+                        action_button(
+                            "取消本次连接",
+                            "cancel",
+                            variant="outlined",
+                            prepend_icon="mdi-close-circle-outline",
+                        )
+                    ]
+                    if pending
+                    else []
+                ),
+            ],
+            class_="d-flex flex-wrap ga-3",
+        ),
+    ]
+    if connected:
+        controls.append(
+            node(
+                "VExpansionPanels",
+                content=[
+                    node(
+                        "VExpansionPanel",
+                        content=[
+                            node("VExpansionPanelTitle", "断开本设备授权…"),
+                            node(
+                                "VExpansionPanelText",
+                                content=[
+                                    node(
+                                        "VAlert",
+                                        "断开后，本设备停止使用当前授权，清除本地账号资料和运行记录。其他设备不受影响；以后使用需要重新授权。",
+                                        type="warning",
+                                        variant="tonal",
+                                        class_="mb-3",
+                                    ),
+                                    action_button(
+                                        "确认断开本设备授权",
+                                        "revoke",
+                                        confirmed=True,
+                                        color="error",
+                                        variant="outlined",
+                                        prepend_icon="mdi-link-variant-off",
+                                    ),
+                                ],
+                            ),
+                        ],
+                    )
+                ],
+                class_="mt-4",
+            )
+        )
+    return section("连接管理", "mdi-gesture-tap-button", controls)
+
+
+def build_page(state, issuer, config_error, next_run):
+    account = state.get("account") or {}
+    overview = state.get("overview") or {}
+    deadline = state.get("grant_expires_at")
+    page = [hero(), *connection_cards(state, config_error)]
+    if not config_error:
+        page.append(connection_actions(state))
+    if not authorization_ready(state):
+        return page
     if account:
         avatar = node("VIcon", "mdi-account-outline", size=34)
         asset = urljoin(issuer + "/", str(account.get("avatar") or ""))
