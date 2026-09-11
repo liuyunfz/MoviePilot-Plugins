@@ -84,7 +84,7 @@ class CloudClient:
     def request(self, method, path, *, token=None, form=None, payload=None):
         headers = {
             "Accept": "application/json",
-            "User-Agent": "MoviePilot-FCloudpanSign/1.1.0",
+            "User-Agent": "MoviePilot-FCloudpanSign/1.1.1",
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -219,12 +219,21 @@ class CloudClient:
             )
             or str(result.get("token_type", "")).lower() != "bearer"
             or not number(result.get("expires_in"))
-            or not 60 <= result["expires_in"] <= 86400
+            or not 0 <= result["expires_in"] <= 86400
             or not set(SCOPES.split()).issubset(str(result.get("scope", "")).split())
+            or (
+                "authorization_expires_at" in result
+                and (
+                    type(result["authorization_expires_at"]) is not int
+                    or not 0 < result["authorization_expires_at"] <= 253402300799
+                )
+            )
         ):
             raise CloudError(
                 "令牌响应或授权权限不完整，请重新授权", code="invalid_response"
             )
+        if result["expires_in"] == 0:
+            raise CloudError("应用授权已到期，请重新授权", code="expired_token")
         return result
 
     def account(self, token):

@@ -1,7 +1,10 @@
 """Native Vuetify cards; page rendering uses only a safe subset of cached data."""
 
+import base64
 import time
 from datetime import datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 import pytz
@@ -82,6 +85,16 @@ def stamp(value):
         return "—"
 
 
+@lru_cache(maxsize=1)
+def brand_icon():
+    # Bundle the original TG artwork so local previews and installed pages do not
+    # depend on a GitHub asset being published or reachable.
+    return (
+        "data:image/png;base64,"
+        + base64.b64encode(Path(__file__).with_name("icon.png").read_bytes()).decode()
+    )
+
+
 def hero():
     return node(
         "VCard",
@@ -90,11 +103,13 @@ def hero():
                 "VCardText",
                 content=[
                     node(
-                        "VIcon",
-                        "mdi-cloud-check-outline",
-                        size=40,
-                        color="primary",
-                        class_="mb-3",
+                        "VImg",
+                        src=brand_icon(),
+                        alt="F-Cloudpan · Telegram 同款图标",
+                        width=64,
+                        height=64,
+                        class_="mx-auto mb-3 rounded-xl",
+                        eager=True,
                     ),
                     node("div", "F-Cloudpan", class_="text-h5 font-weight-bold"),
                     node(
@@ -113,7 +128,7 @@ def hero():
     )
 
 
-def build_form(config):
+def build_form(application_ready=True):
     return [
         node(
             "VForm",
@@ -177,40 +192,39 @@ def build_form(config):
                     [
                         node(
                             "VAlert",
-                            "使用站点提供的公共应用 Client ID 连接。无需应用密钥、MoviePilot 公网地址或回调配置，每位用户单独确认授权。",
+                            "插件已内置 F-Cloudpan 站点与“MoviePilot 签到助手”应用。你只需登录自己的云盘账号并确认授权，无需填写站点地址或应用信息。",
                             type="info",
                             variant="tonal",
                             class_="mb-4",
                         ),
-                        node(
-                            "VRow",
-                            content=[
-                                column(
-                                    field(
-                                        "issuer",
-                                        "F-Cloudpan 站点根地址",
-                                        placeholder="https://你的云盘域名",
-                                    )
-                                ),
-                                column(
-                                    field(
-                                        "client_id",
-                                        "公共应用 Client ID",
-                                        hint="由云盘站点统一提供，可公开；不要填写 Secret",
-                                        persistent_hint=True,
-                                    )
-                                ),
-                            ],
+                        *(
+                            []
+                            if application_ready
+                            else [
+                                node(
+                                    "VAlert",
+                                    "此本地开发版本还在等待正式应用配置，连接暂不可用。",
+                                    type="warning",
+                                    variant="tonal",
+                                    class_="mb-4",
+                                )
+                            ]
                         ),
                         node(
                             "VRow",
                             content=[
-                                column(switch("prepare_auth", "保存后连接 / 重新授权")),
+                                column(
+                                    switch(
+                                        "prepare_auth",
+                                        "保存后连接 / 重新授权",
+                                        disabled=not application_ready,
+                                    )
+                                ),
                                 column(switch("cancel_auth", "保存后取消本次连接")),
                                 column(
                                     switch(
                                         "revoke_auth",
-                                        "保存后撤销并解除授权",
+                                        "保存后断开本设备授权",
                                         color="error",
                                     )
                                 ),
@@ -218,7 +232,7 @@ def build_form(config):
                         ),
                         node(
                             "VAlert",
-                            "保存后打开插件详情，点击授权链接，在云盘核对确认码并允许。无需返回 MP 的回调页面；后台会完成连接，重新打开详情查看结果。设备码通常 10 分钟有效；30 天后需重新授权。",
+                            "保存后打开插件详情，点击授权链接，在云盘核对确认码并允许。无需返回 MP 的回调页面；后台会完成连接，重新打开详情查看结果。确认码通常 10 分钟有效。同一用户的各设备共用应用授权期限（最长 30 天），新增设备不延期。",
                             type="info",
                             variant="tonal",
                             class_="mt-2",
@@ -287,22 +301,23 @@ def build_form(config):
     ]
 
 
-def build_page(state, config, config_error, next_run):
+def build_page(state, issuer, config_error, next_run):
     account = state.get("account") or {}
     overview = state.get("overview") or {}
     pending = state.get("pending") or {}
     now = time.time()
+    deadline = state.get("grant_expires_at")
     ready = (
         bool(state.get("tokens"))
         and not state.get("blocked")
         and not state.get("refresh_in_flight")
-        and state.get("grant_expires_at", 0) > now
+        and (deadline is None or deadline > now)
     )
-    message = state.get("status", "请在配置页填写公共应用信息并连接账号")
+    message = state.get("status", "请在配置页选择连接账号并保存")
     if state.get("refresh_in_flight"):
         message = "上次令牌刷新结果未知，已停止重试，请重新授权"
-    elif state.get("tokens") and state.get("grant_expires_at", 0) <= now:
-        message = "30 天授权已到期，请重新授权"
+    elif state.get("tokens") and deadline is not None and deadline <= now:
+        message = "应用授权已到期，请重新授权"
     page = [
         hero(),
         node(
@@ -378,9 +393,7 @@ def build_page(state, config, config_error, next_run):
             )
     if account:
         avatar = node("VIcon", "mdi-account-outline", size=34)
-        asset = urljoin(
-            config.get("issuer", "") + "/", str(account.get("avatar") or "")
-        )
+        asset = urljoin(issuer + "/", str(account.get("avatar") or ""))
         parsed = urlsplit(asset)
         if (
             account.get("avatar")
@@ -603,7 +616,14 @@ def build_page(state, config, config_error, next_run):
                 ),
                 node(
                     "div",
-                    "授权最晚到期：" + stamp(state.get("grant_expires_at")),
+                    "应用授权到期："
+                    + (
+                        stamp(deadline)
+                        if deadline is not None
+                        else "云盘暂未返回到期时间"
+                        if state.get("tokens")
+                        else "—"
+                    ),
                     class_="text-body-2 mt-2",
                 ),
                 node(

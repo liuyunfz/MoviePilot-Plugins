@@ -130,6 +130,7 @@ class Upstream:
         self.device_status = 400
         self.device_override = {}
         self.device_interval = 5
+        self.token_override = {}
 
     def handle(self, method, path, headers, body):
         self.requests.append((method, path, dict(headers), body))
@@ -163,6 +164,7 @@ class Upstream:
                 return 500, {"error": "do not log upstream secret"}
             tokens = pair(chr(ord("a") + self.exchange_count))
             tokens["scope"] = self.granted_scope
+            tokens.update(self.token_override)
             return 200, tokens
         if path == "/oauth/account":
             if self.unauthorized_once:
@@ -239,12 +241,9 @@ def plugin(upstream, monkeypatch):
     # Jobs remain inspectable but never execute during unrelated assertions.
     monkeypatch.setattr(plugin_module.BackgroundScheduler, "start", lambda self: None)
     instance = FCloudpanSign()
-    config = {
-        **instance.DEFAULTS,
-        "issuer": upstream.issuer,
-        "client_id": "fixture:id",
-    }
-    instance.init_plugin(config)
+    monkeypatch.setattr(FCloudpanSign, "FCLOUDPAN_ORIGIN", upstream.issuer)
+    monkeypatch.setattr(FCloudpanSign, "OAUTH_CLIENT_ID", "fixture:id")
+    instance.init_plugin(instance.DEFAULTS)
     yield instance
     instance.stop_service()
 
@@ -257,6 +256,7 @@ def authorize_locally(plugin, *, expired=False):
             "expires_at": time.time() - 1 if expired else time.time() + 3600,
         },
         grant_expires_at=time.time() + 30 * 86400,
+        grant_expiry_verified=True,
     )
     plugin._save(state)
 
@@ -551,10 +551,11 @@ def test_account_mismatch_blocks_before_signin(plugin, upstream):
     assert not any(r[0:2] == ("POST", "/api/check-in") for r in upstream.requests)
 
 
-def test_configuration_change_removes_other_identity(plugin):
+def test_builtin_application_change_removes_other_identity(plugin, monkeypatch):
     authorize_locally(plugin)
     plugin.run(sign=False)
-    plugin.init_plugin({**plugin._config, "client_id": "new-public-id"})
+    monkeypatch.setattr(FCloudpanSign, "OAUTH_CLIENT_ID", "new-public-id")
+    plugin.init_plugin(plugin._config)
     assert not plugin._read().get("tokens")
     assert not plugin._read().get("account")
     assert not plugin._read()["history"]
@@ -699,7 +700,7 @@ def test_page_expiry_and_refresh_warning_override_stale_success(plugin):
     state = plugin._read()
     state.update(status="已授权", grant_expires_at=0)
     plugin._save(state)
-    assert "30 天授权已到期" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "应用授权已到期" in json.dumps(plugin.get_page(), ensure_ascii=False)
     state.update(refresh_in_flight=True)
     plugin._save(state)
     assert "刷新结果未知" in json.dumps(plugin.get_page(), ensure_ascii=False)
@@ -731,7 +732,8 @@ def test_pending_ui_only_exposes_user_code_and_authorization_link(plugin, upstre
     assert pending["device_code"] not in page
     assert pending["user_code"] in page
     assert pending["verification_uri_complete"] in page
-    assert "data:image" not in page
+    # The only inline image is the shared brand icon; no QR code is generated.
+    assert "二维码" not in page
     assert len(upstream.requests) == calls
 
 
@@ -807,10 +809,11 @@ def test_stale_device_job_does_not_touch_replacement_authorization(plugin, upstr
     assert upstream.exchange_count == 0
 
 
-def test_invalid_configuration_hides_cached_identity(plugin):
+def test_invalid_builtin_origin_hides_cached_identity(plugin, monkeypatch):
     authorize_locally(plugin)
     plugin.run(sign=False)
-    plugin.init_plugin({**plugin._config, "issuer": "invalid"})
+    monkeypatch.setattr(FCloudpanSign, "FCLOUDPAN_ORIGIN", "invalid")
+    plugin.init_plugin(plugin._config)
     assert ACCOUNT["name"] not in json.dumps(plugin.get_page(), ensure_ascii=False)
 
 
@@ -822,3 +825,129 @@ def test_device_code_never_enters_confirmation_link(plugin, upstream):
     }
     plugin.init_plugin({**plugin._config, "prepare_auth": True})
     assert not plugin._read().get("pending")
+
+
+def test_legacy_user_config_cannot_override_builtin_application(plugin, upstream):
+    authorize_locally(plugin)
+    before = plugin._read()["tokens"]
+    plugin.init_plugin(
+        {
+            **plugin._config,
+            "issuer": "https://untrusted.example",
+            "client_id": "other-app",
+        }
+    )
+    assert plugin._client().issuer == upstream.issuer
+    assert plugin._client().client_id == "fixture:id"
+    assert plugin._read()["tokens"] == before
+    assert "issuer" not in plugin.saved_config
+    assert "client_id" not in plugin.saved_config
+    assert plugin.run(sign=False)["success"]
+
+
+def test_end_user_form_has_no_application_settings(plugin):
+    form, defaults = plugin.get_form()
+
+    def models(node):
+        if isinstance(node, dict):
+            yield node.get("props", {}).get("model")
+            for item in node.values():
+                yield from models(item)
+        elif isinstance(node, list):
+            for item in node:
+                yield from models(item)
+
+    assert not {"issuer", "client_id", "client_secret", "mp_url"}.intersection(
+        models(form)
+    )
+    assert not {"issuer", "client_id", "client_secret", "mp_url"}.intersection(defaults)
+
+
+def test_unconfigured_release_never_uses_old_user_application(
+    plugin, upstream, monkeypatch
+):
+    monkeypatch.setattr(FCloudpanSign, "FCLOUDPAN_ORIGIN", "")
+    monkeypatch.setattr(FCloudpanSign, "OAUTH_CLIENT_ID", "")
+    plugin.init_plugin(
+        {
+            **plugin._config,
+            "issuer": upstream.issuer,
+            "client_id": "fixture:id",
+            "prepare_auth": True,
+        }
+    )
+    assert not upstream.requests
+    assert plugin._scheduler is None
+    assert "正式应用" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "暂不可用" in json.dumps(plugin.get_form(), ensure_ascii=False)
+
+
+def test_new_device_uses_shared_expiry_not_new_thirty_days(plugin, upstream):
+    deadline = int(time.time()) + 2 * 86400
+    upstream.token_override = {"authorization_expires_at": deadline}
+    begin(plugin)
+    poll(plugin)
+    assert plugin._read()["grant_expires_at"] == deadline
+    assert plugin._read()["grant_expiry_verified"]
+    state = plugin._read()
+    state["tokens"]["expires_at"] = 0
+    plugin._save(state)
+    assert plugin.run(sign=False)["success"]
+    assert plugin._read()["grant_expires_at"] == deadline
+
+
+def test_old_server_missing_deadline_does_not_invent_expiry(plugin):
+    begin(plugin)
+    poll(plugin)
+    assert plugin._read()["grant_expires_at"] is None
+    assert plugin.run(sign=False)["success"]
+    assert "云盘暂未返回到期时间" in json.dumps(plugin.get_page(), ensure_ascii=False)
+
+
+def test_reload_discards_legacy_per_device_expiry_estimate(plugin):
+    authorize_locally(plugin)
+    state = plugin._read()
+    state.pop("grant_expiry_verified")
+    plugin._save(state)
+    plugin.init_plugin(plugin._config)
+    assert plugin._read()["grant_expires_at"] is None
+    assert plugin._read()["tokens"]
+
+
+def test_short_lived_token_near_shared_expiry_avoids_refresh_loop(plugin, upstream):
+    deadline = int(time.time()) + 20
+    upstream.token_override = {"expires_in": 15, "authorization_expires_at": deadline}
+    begin(plugin)
+    poll(plugin)
+    assert plugin._read()["tokens"]["expires_in"] == 15
+    exchanges = upstream.exchange_count
+    assert plugin.run(sign=False)["success"]
+    assert upstream.exchange_count == exchanges
+    state = plugin._read()
+    state["grant_expires_at"] = time.time() - 1
+    plugin._save(state)
+    requests_before = len(upstream.requests)
+    assert not plugin.run(sign=False)["success"]
+    assert len(upstream.requests) == requests_before
+
+
+@pytest.mark.parametrize("deadline", [True, "not-a-timestamp", None, -1, 1.5])
+def test_rejects_invalid_shared_deadline(plugin, upstream, deadline):
+    upstream.token_override = {"authorization_expires_at": deadline}
+    begin(plugin)
+    poll(plugin)
+    assert not plugin._read().get("tokens")
+    assert not plugin._read().get("pending")
+
+
+def test_zero_second_token_is_expired_and_stops_device_polling(plugin, upstream):
+    upstream.token_override = {
+        "expires_in": 0,
+        "authorization_expires_at": int(time.time()),
+    }
+    begin(plugin)
+    poll(plugin)
+    assert not plugin._read().get("tokens")
+    assert not plugin._read().get("pending")
+    assert "已到期" in plugin._read()["status"]
+    assert not any(row[1] == "/oauth/account" for row in upstream.requests)

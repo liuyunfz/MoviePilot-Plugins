@@ -23,8 +23,8 @@ from .ui import build_form, build_page
 class FCloudpanSign(_PluginBase):
     plugin_name = "F-Cloudpan 签到"
     plugin_desc = "通过应用授权自动签到，读取积分、VIP 与签到记录"
-    plugin_icon = "https://raw.githubusercontent.com/liuyunfz/MoviePilot-Plugins/main/icons/fcloudpansign.svg"
-    plugin_version = "1.1.0"
+    plugin_icon = "https://raw.githubusercontent.com/liuyunfz/MoviePilot-Plugins/main/icons/fcloudpansign.png"
+    plugin_version = "1.1.1"
     plugin_author = "liuyunfz"
     author_url = "https://github.com/liuyunfz"
     plugin_config_prefix = "fcloudpansign_"
@@ -36,6 +36,12 @@ class FCloudpanSign(_PluginBase):
     _generation = ""
     _config: ClassVar[dict] = {}
     _config_error = ""
+    # Public release identity, set by the maintainer after production registration.
+    # These identifiers are public; never add a Client Secret or local test ID here.
+    FCLOUDPAN_ORIGIN = "https://fcloudpan.com"
+    OAUTH_CLIENT_ID = "app_TobngQ3HIC-XGWODMEDA40k4zO9nPElvzFyh1a9QzpM"
+    _issuer = ""
+    _client_id = ""
     DEFAULTS: ClassVar[dict] = {
         "enabled": False,
         "notify": False,
@@ -44,8 +50,6 @@ class FCloudpanSign(_PluginBase):
         "prepare_auth": False,
         "revoke_auth": False,
         "cancel_auth": False,
-        "issuer": "",
-        "client_id": "",
         "cron": "30 9 * * *",
         "mode": "STANDARD",
         "history_days": 30,
@@ -71,8 +75,8 @@ class FCloudpanSign(_PluginBase):
         if self._config_error:
             raise CloudError(self._config_error)
         return CloudClient(
-            self._config["issuer"],
-            self._config["client_id"],
+            self._issuer,
+            self._client_id,
             self._config["timeout"],
         )
 
@@ -85,18 +89,17 @@ class FCloudpanSign(_PluginBase):
                 for key, value in self.DEFAULTS.items()
             }
             self._config_error = ""
+            self._issuer = ""
+            self._client_id = ""
             try:
-                self._config["issuer"] = origin_url(self._config["issuer"])
-                self._config["client_id"] = str(
-                    self._config.get("client_id") or ""
-                ).strip()
-                if (
-                    not self._config["client_id"]
-                    or len(self._config["client_id"]) > 256
-                ):
+                if not self.FCLOUDPAN_ORIGIN or not self.OAUTH_CLIENT_ID:
                     raise CloudError(
-                        "请填写云盘地址和站点提供的公共 Client ID（无需 Secret）"
+                        "当前开发版本尚未内置正式应用，请等待维护者完成应用配置"
                     )
+                self._issuer = origin_url(self.FCLOUDPAN_ORIGIN)
+                self._client_id = self.OAUTH_CLIENT_ID.strip()
+                if not self._client_id or len(self._client_id) > 256:
+                    raise CloudError("内置应用标识无效，请联系插件维护者")
                 for key, low, high in (
                     ("history_days", 1, 365),
                     ("timeout", 5, 60),
@@ -129,17 +132,15 @@ class FCloudpanSign(_PluginBase):
             for key in actions:
                 self._config[key] = False
             if actions or any(
-                key in (config or {}) for key in ("mp_url", "client_secret")
+                key in (config or {})
+                for key in ("mp_url", "client_secret", "issuer", "client_id")
             ):
                 self.update_config(dict(self._config))
             if self._config_error:
                 return
 
             fingerprint = hashlib.sha256(
-                (
-                    "public-device-v1\0"
-                    + "\0".join(self._config[key] for key in ("issuer", "client_id"))
-                ).encode()
+                (f"public-device-v1\0{self._issuer}\0{self._client_id}").encode()
             ).hexdigest()
             state = self._read()
             if state.get("binding") != fingerprint:
@@ -148,6 +149,15 @@ class FCloudpanSign(_PluginBase):
                     "status": "请连接公共应用；从 1.0 升级需重新授权，并在云盘撤销旧应用授权",
                     "history": [],
                 }
+                self._save(state)
+            if state.get("tokens") and "grant_expiry_verified" not in state:
+                # Old plugin versions estimated a new 30-day window per device.
+                # That estimate is invalid now that all devices share one app expiry.
+                deadline = state["tokens"].get("authorization_expires_at")
+                state.update(
+                    grant_expires_at=deadline,
+                    grant_expiry_verified=deadline is not None,
+                )
                 self._save(state)
             if "revoke_auth" in actions:
                 self._revoke()
@@ -336,7 +346,8 @@ class FCloudpanSign(_PluginBase):
             state = {
                 "binding": state.get("binding"),
                 "tokens": tokens,
-                "grant_expires_at": now + 30 * 86400,
+                "grant_expires_at": tokens.get("authorization_expires_at"),
+                "grant_expiry_verified": "authorization_expires_at" in tokens,
                 "status": "授权成功，等待读取资料",
                 "history": [],
             }
@@ -354,9 +365,11 @@ class FCloudpanSign(_PluginBase):
             raise CloudError("尚未授权或授权已停止，请在配置页连接账号")
         if state.get("refresh_in_flight"):
             raise CloudError("上次刷新结果未知，请重新授权；已停止重试旧刷新令牌")
-        if state.get("grant_expires_at", 0) <= time.time():
-            raise CloudError("30 天授权已到期，请重新授权")
-        if not force and tokens.get("expires_at", 0) > time.time() + 90:
+        deadline = state.get("grant_expires_at")
+        if deadline is not None and deadline <= time.time():
+            raise CloudError("应用授权已到期，请重新授权")
+        margin = min(90, max(0.1, tokens.get("expires_in", 3600) / 10))
+        if not force and tokens.get("expires_at", 0) > time.time() + margin:
             return tokens["access_token"]
         state["refresh_in_flight"] = True
         self._save(state)
@@ -365,6 +378,11 @@ class FCloudpanSign(_PluginBase):
         )
         new_tokens["expires_at"] = time.time() + new_tokens["expires_in"]
         state.update(tokens=new_tokens, refresh_in_flight=False)
+        if "authorization_expires_at" in new_tokens:
+            state.update(
+                grant_expires_at=new_tokens["authorization_expires_at"],
+                grant_expiry_verified=True,
+            )
         self._save(state)
         return new_tokens["access_token"]
 
@@ -504,7 +522,7 @@ class FCloudpanSign(_PluginBase):
                 try:
                     self.post_message(
                         mtype=NotificationType.SiteMessage,
-                        title=f"🐝 F-Cloudpan · {status}",
+                        title=f"F-Cloudpan · {status}",
                         text=text,
                     )
                 except Exception:  # noqa: BLE001 -- notification errors must not expose credentials
@@ -529,7 +547,9 @@ class FCloudpanSign(_PluginBase):
 
     def get_form(self):
         with self._lock:
-            return build_form(self._config or self.DEFAULTS), dict(self.DEFAULTS)
+            return build_form(
+                bool(self.FCLOUDPAN_ORIGIN and self.OAUTH_CLIENT_ID)
+            ), dict(self.DEFAULTS)
 
     def get_page(self):
         with self._lock:
@@ -541,7 +561,7 @@ class FCloudpanSign(_PluginBase):
                 )
             return build_page(
                 {} if self._config_error else self._read(),
-                self._config,
+                self._issuer,
                 self._config_error,
                 next_run,
             )

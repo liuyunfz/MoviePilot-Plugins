@@ -53,12 +53,13 @@
     "name": "F-Cloudpan 签到",
     "description": "通过应用授权自动签到，读取积分、VIP 与签到记录",
     "labels": "签到,云盘,OAuth,F-Cloudpan",
-    "version": "1.1.0",
-    "icon": "https://raw.githubusercontent.com/liuyunfz/MoviePilot-Plugins/main/icons/fcloudpansign.svg",
+    "version": "1.1.1",
+    "icon": "https://raw.githubusercontent.com/liuyunfz/MoviePilot-Plugins/main/icons/fcloudpansign.png",
     "author": "liuyunfz",
     "level": 2,
     "v2": true,
     "history": {
+      "v1.1.1": "内置正式公共应用与固定站点，统一 Telegram 图标；共享应用授权期限、独立设备断开及短有效期令牌处理",
       "v1.1.0": "改用公共应用设备授权：授权直达链接、无 Secret/回调、授权轮询退避与重载恢复；需服务端 PUBLIC_DEVICE 支持",
       "v1.0.0": "首次发布：OAuth 授权码与 PKCE、自动轮换、定时签到、资料卡、近 14 日签到记录及授权撤销"
     }
