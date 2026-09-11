@@ -17,16 +17,23 @@ from app.schemas import NotificationType
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import Body, Depends, HTTPException
+from fastapi.responses import JSONResponse
 
 from .client import DEVICE_GRANT, CloudClient, CloudError, origin_url
-from .ui import authorization_ready, build_form, build_page
+from .ui import (
+    authorization_ready,
+    build_form,
+    build_page,
+    connection_actions,
+    connection_cards,
+)
 
 
 class FCloudpanSign(_PluginBase):
     plugin_name = "F-Cloudpan 签到"
     plugin_desc = "通过应用授权自动签到，读取积分、VIP 与签到记录"
     plugin_icon = "https://raw.githubusercontent.com/liuyunfz/MoviePilot-Plugins/main/icons/fcloudpansign.png"
-    plugin_version = "1.1.2"
+    plugin_version = "1.2.0"
     plugin_author = "liuyunfz"
     author_url = "https://github.com/liuyunfz"
     plugin_config_prefix = "fcloudpansign_"
@@ -266,7 +273,7 @@ class FCloudpanSign(_PluginBase):
             "expires_at": now + device["expires_in"],
             "next_poll_at": now + device["interval"],
         }
-        state["status"] = "等待确认，请在当前数据页或重新打开设置页查看授权链接与确认码"
+        state["status"] = "等待你在云盘确认授权，本页将自动显示结果"
         self._save(state)
 
     def _schedule_poll(self):
@@ -564,6 +571,41 @@ class FCloudpanSign(_PluginBase):
     def get_service(self):
         return []
 
+    @staticmethod
+    def get_render_mode():
+        return "vue", "dist/assets"
+
+    def view(self):
+        """Read only cached state. Polling this route never polls the cloud."""
+        with self._lock:
+            state = {} if self._config_error else self._read()
+            form, _ = self.get_form()
+            return JSONResponse(
+                {
+                    "page": self.get_page()[1:],
+                    "connection": [
+                        *connection_cards(state, self._config_error),
+                        *([] if self._config_error else [connection_actions(state)]),
+                    ],
+                    "origin": self._issuer,
+                    "form": form[0]["content"][2:],
+                    "config": {
+                        key: self._config.get(key, value)
+                        for key, value in self.DEFAULTS.items()
+                    },
+                    "authorized": not self._config_error and authorization_ready(state),
+                    "pending": bool(state.get("pending")),
+                    "watching": bool(state.get("pending"))
+                    or bool(self._scheduler and self._scheduler.get_job("once")),
+                    "version": self.plugin_version,
+                },
+                headers={
+                    "Cache-Control": "private, no-store",
+                    "CDN-Cache-Control": "no-store",
+                    "Vary": "Cookie, Authorization",
+                },
+            )
+
     def get_api(self):
         return [
             {
@@ -573,7 +615,15 @@ class FCloudpanSign(_PluginBase):
                 "summary": "F-Cloudpan 连接管理",
                 "auth": "bear",
                 "dependencies": [Depends(get_current_active_superuser)],
-            }
+            },
+            {
+                "path": "/view",
+                "endpoint": self.view,
+                "methods": ["GET"],
+                "summary": "F-Cloudpan 本地界面状态",
+                "auth": "bear",
+                "dependencies": [Depends(get_current_active_superuser)],
+            },
         ]
 
     def action(
@@ -649,6 +699,7 @@ class FCloudpanSign(_PluginBase):
                 self._issuer,
                 self._config_error,
                 next_run,
+                include_connection=False,
             )
 
     def stop_service(self):

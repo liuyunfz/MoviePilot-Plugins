@@ -117,7 +117,7 @@ class CloudClient:
     def request(self, method, path, *, token=None, form=None, payload=None):
         headers = {
             "Accept": "application/json",
-            "User-Agent": "MoviePilot-FCloudpanSign/1.1.2",
+            "User-Agent": "MoviePilot-FCloudpanSign/1.2.0",
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"

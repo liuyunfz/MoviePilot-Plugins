@@ -1,13 +1,12 @@
 """Native Vuetify cards; page rendering uses only a safe subset of cached data."""
 
-import base64
 import time
 from datetime import datetime, timedelta
-from functools import lru_cache
-from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 import pytz
+
+from .assets import BRAND_ICON
 
 
 def node(component, text=None, content=None, **props):
@@ -85,14 +84,8 @@ def stamp(value):
         return "—"
 
 
-@lru_cache(maxsize=1)
 def brand_icon():
-    # Bundle the original TG artwork so local previews and installed pages do not
-    # depend on a GitHub asset being published or reachable.
-    return (
-        "data:image/png;base64,"
-        + base64.b64encode(Path(__file__).with_name("icon.png").read_bytes()).decode()
-    )
+    return BRAND_ICON
 
 
 def hero():
@@ -381,7 +374,7 @@ def connection_cards(state, config_error=""):
                             "div",
                             "有效至 "
                             + stamp(pending["expires_at"])
-                            + "；插件正在后台等待，完成后重新打开详情。取消连接请使用“查看数据”页的按钮。",
+                            + "；插件正在后台等待，授权完成后本页自动更新。取消请点击下方“取消本次连接”。",
                             class_="text-caption text-medium-emphasis mt-3",
                         ),
                     ],
@@ -419,7 +412,7 @@ def connection_actions(state):
     controls = [
         node(
             "div",
-            "按钮点击后立即执行并刷新本页，无需保存设置。网络代理和超时使用已保存的配置。",
+            "点击按钮立即执行，授权状态会自动更新。网络代理和超时使用已保存的配置。",
             class_="text-body-2 mb-3",
         ),
         node(
@@ -486,28 +479,46 @@ def connection_actions(state):
     return section("连接管理", "mdi-gesture-tap-button", controls)
 
 
-def build_page(state, issuer, config_error, next_run):
+def build_page(state, issuer, config_error, next_run, include_connection=True):
     account = state.get("account") or {}
     overview = state.get("overview") or {}
     deadline = state.get("grant_expires_at")
-    page = [hero(), *connection_cards(state, config_error)]
-    if not config_error:
-        page.append(connection_actions(state))
+    page = [hero()]
+    if include_connection:
+        page.extend(connection_cards(state, config_error))
+        if not config_error:
+            page.append(connection_actions(state))
     if not authorization_ready(state):
+        if not include_connection:
+            page.append(
+                node(
+                    "VAlert",
+                    "暂无可展示的数据，请在设置页连接云盘账号。",
+                    type="info",
+                    variant="tonal",
+                )
+            )
         return page
     if account:
-        avatar = node("VIcon", "mdi-account-outline", size=34)
-        asset = urljoin(issuer + "/", str(account.get("avatar") or ""))
-        parsed = urlsplit(asset)
-        if (
-            account.get("avatar")
-            and parsed.scheme == "https"
-            and not parsed.username
-            and not parsed.password
-        ):
-            avatar = node(
-                "VImg", src=asset, alt="云盘头像", referrerpolicy="no-referrer"
+        asset = ""
+        try:
+            asset = urljoin(issuer + "/", str(account.get("avatar") or ""))
+            parsed = urlsplit(asset)
+            valid_avatar = (
+                bool(account.get("avatar"))
+                and parsed.scheme == "https"
+                and not parsed.username
+                and not parsed.password
+                and not any(c.isspace() or ord(c) < 32 for c in asset)
+                and "\\" not in asset
             )
+        except ValueError:
+            valid_avatar = False
+        avatar = node(
+            "FCloudpanAvatar",
+            src=asset if valid_avatar else "",
+            name=account.get("name", ""),
+        )
         today = datetime.now(pytz.timezone("Asia/Shanghai")).strftime("%Y-%m-%d")
         fresh = overview.get("today") == today
         checked = fresh and overview.get("checkedInToday")

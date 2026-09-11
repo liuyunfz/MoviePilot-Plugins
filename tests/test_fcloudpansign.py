@@ -306,7 +306,7 @@ def test_rejects_unsafe_origins(url):
 
 def test_public_device_roundtrip_has_no_secret_basic_or_callback(plugin, upstream):
     pending = begin(plugin)
-    assert [route["path"] for route in plugin.get_api()] == ["/action"]
+    assert [route["path"] for route in plugin.get_api()] == ["/action", "/view"]
     assert plugin._scheduler.get_job("device_auth")
     poll(plugin)
     assert plugin._read()["account"]["sub"] == "42"
@@ -714,10 +714,10 @@ def test_page_expiry_and_refresh_warning_override_stale_success(plugin):
     state = plugin._read()
     state.update(status="已授权", grant_expires_at=0)
     plugin._save(state)
-    assert "应用授权已到期" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "应用授权已到期" in plugin.view().body.decode()
     state.update(refresh_in_flight=True)
     plugin._save(state)
-    assert "刷新结果未知" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "刷新结果未知" in plugin.view().body.decode()
 
 
 def test_upgrade_removes_legacy_secret_and_requires_public_authorization(plugin):
@@ -742,7 +742,7 @@ def test_upgrade_removes_legacy_secret_and_requires_public_authorization(plugin)
 def test_pending_ui_only_exposes_user_code_and_authorization_link(plugin, upstream):
     pending = begin(plugin)
     calls = len(upstream.requests)
-    page = json.dumps(plugin.get_page(), ensure_ascii=False)
+    page = plugin.view().body.decode()
     assert pending["device_code"] not in page
     assert pending["user_code"] in page
     assert pending["verification_uri_complete"] in page
@@ -892,7 +892,7 @@ def test_unconfigured_release_never_uses_old_user_application(
     )
     assert not upstream.requests
     assert plugin._scheduler is None
-    assert "正式应用" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "正式应用" in plugin.view().body.decode()
     assert "暂不可用" in json.dumps(plugin.get_form(), ensure_ascii=False)
 
 
@@ -1168,10 +1168,14 @@ def test_action_buttons_have_no_form_switches_and_only_offer_valid_actions(plugi
             for child in value:
                 yield from actions(child)
 
-    assert list(actions(plugin.get_page())) == ["connect"]
+    assert list(actions(json.loads(plugin.view().body)["connection"])) == ["connect"]
     authorize_locally(plugin)
     begin(plugin)
-    assert list(actions(plugin.get_page())) == ["connect", "cancel", "revoke"]
+    assert list(actions(json.loads(plugin.view().body)["connection"])) == [
+        "connect",
+        "cancel",
+        "revoke",
+    ]
     form = json.dumps(plugin.get_form()[0], ensure_ascii=False)
     assert '"model": "cancel_auth"' not in form
     assert '"model": "revoke_auth"' not in form
@@ -1231,3 +1235,133 @@ def test_authorization_success_restores_saved_schedule_and_form(plugin, upstream
     assert plugin._config["cron"] == "15 8 * * *"
     assert "运行设置" in json.dumps(plugin.get_form()[0], ensure_ascii=False)
     assert not any(row[:2] == ("POST", "/api/check-in") for row in upstream.requests)
+
+
+def test_view_is_admin_only_read_only_cached_and_has_no_credentials(
+    action_api, plugin, upstream
+):
+    pending = begin(plugin)
+    calls = len(upstream.requests)
+    assert action_api.get("/view").status_code == 403
+    response = action_api.get(
+        "/view", headers={"Authorization": "Bearer fixture-admin"}
+    )
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.headers["cdn-cache-control"] == "no-store"
+    assert response.json()["pending"] and not response.json()["authorized"]
+    assert pending["device_code"] not in response.text
+    assert "data:image" not in response.text  # Brand image ships once in the UI bundle.
+    assert "client_id" not in response.json()["config"]
+    assert len(upstream.requests) == calls
+    poll(plugin)
+    response = action_api.get(
+        "/view", headers={"Authorization": "Bearer fixture-admin"}
+    )
+    assert response.json()["authorized"] and not response.json()["pending"]
+    assert "运行设置" in response.text
+    for token in plugin._read()["tokens"].values():
+        if isinstance(token, str) and token.startswith("fco_"):
+            assert token not in response.text
+
+
+def test_brand_survives_moviepilot_text_install_and_matches_original():
+    import base64
+    import hashlib
+
+    source = (plugin_path / "assets.py").read_bytes()
+    # MP's directory installer writes response.text using UTF-8.
+    response = requests.Response()
+    response._content = source
+    response.encoding = "utf-8"
+    import ast
+
+    text = response.text.encode("utf-8").decode("utf-8")
+    icon = ast.literal_eval(text.split("BRAND_ICON = ", 1)[1].strip())
+    decoded = base64.b64decode(icon.split(",", 1)[1], validate=True)
+    assert decoded.startswith(b"\x89PNG\r\n\x1a\n")
+    assert (
+        hashlib.sha256(decoded).hexdigest()
+        == "52e6a024e7698b6a2cf4161a98222b22cd04d74299bac87feb5cc18683eb6d52"
+    )
+    assert not (plugin_path / "icon.png").exists()
+    assert FCloudpanSign.get_render_mode() == ("vue", "dist/assets")
+
+
+def test_vue_bundle_uses_sibling_entries_and_text_safe_original_image():
+    import base64
+    import hashlib
+    import re
+
+    assets = plugin_path / "dist" / "assets"
+    entry = (assets / "remoteEntry.js").read_text()
+    assert '"./Page"' in entry and '"./Config"' in entry
+    assert "${__federation_expose_" not in entry
+    assert '"./assets/' not in entry
+    for relative in re.findall(r'"\./([^"/]+\.js)"', entry):
+        assert (assets / relative).is_file()
+    images = []
+    for file in assets.iterdir():
+        content = file.read_bytes()
+        assert content.decode("utf-8").encode("utf-8") == content
+        images += re.findall(rb"data:image/png;base64,([A-Za-z0-9+/=]+)", content)
+    assert len(images) == 1
+    assert hashlib.sha256(base64.b64decode(images[0], validate=True)).hexdigest() == (
+        "52e6a024e7698b6a2cf4161a98222b22cd04d74299bac87feb5cc18683eb6d52"
+    )
+
+
+def test_data_page_contains_no_authorization_controls_or_network_settings(plugin):
+    authorize_locally(plugin)
+    begin(plugin)
+    state = json.loads(plugin.view().body)
+    page = json.dumps(state["page"], ensure_ascii=False)
+    connection = json.dumps(state["connection"], ensure_ascii=False)
+    for text in (
+        "连接管理",
+        "取消本次连接",
+        "断开本设备授权",
+        "verification_uri",
+        "网络设置",
+        '"events"',
+    ):
+        assert text not in page
+    assert "取消本次连接" in connection
+    assert "断开本设备授权" in connection
+
+
+@pytest.mark.parametrize(
+    "avatar, expected",
+    [
+        (
+            "/apps/fcloudpan/avatars/anonymous-07.webp",
+            "https://fcloudpan.com/apps/fcloudpan/avatars/anonymous-07.webp",
+        ),
+        ("https://cdn.example/avatar.png", "https://cdn.example/avatar.png"),
+        (None, ""),
+        ("javascript:alert(1)", ""),
+        ("https://user:secret@cdn.example/a.png", ""),
+        ("https://[invalid", ""),
+    ],
+)
+def test_avatar_resolves_relative_paths_and_uses_safe_fallback(
+    plugin, avatar, expected
+):
+    authorize_locally(plugin)
+    state = plugin._read()
+    state["account"] = {**ACCOUNT, "avatar": avatar}
+    plugin._save(state)
+    plugin._issuer = "https://fcloudpan.com"
+
+    def find(value):
+        if isinstance(value, dict):
+            if value.get("component") == "FCloudpanAvatar":
+                yield value
+            for child in value.values():
+                yield from find(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from find(child)
+
+    avatar_node = next(find(plugin.get_page()))
+    assert avatar_node["props"]["src"] == expected
