@@ -1,6 +1,6 @@
 """
 NodeSeek 签到插件
-版本: 1.2.3
+版本: 1.2.4
 作者: liuyunfz
 功能:
 - 自动完成 NodeSeek 每日签到
@@ -41,7 +41,7 @@ class NodeSeekSign(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/favicon.ico"
     # 插件版本
-    plugin_version = "1.2.3"
+    plugin_version = "1.2.4"
     # 插件作者
     plugin_author = "liuyunfz"
     # 作者主页
@@ -270,11 +270,11 @@ class NodeSeekSign(_PluginBase):
         had_cookie = bool(self._cookie)
         if not had_cookie:
             self._login_in_page(page)
-        page.goto(f"{self._base_url}/board", wait_until="domcontentloaded", timeout=60000)
+        else:
+            page.goto(f"{self._base_url}/board", wait_until="domcontentloaded", timeout=60000)
         if had_cookie and self._username and self._password and page.query_selector('a[href="/signIn.html"]'):
             logger.info("NodeSeek 登录会话已失效，在浏览器中重新登录")
             self._login_in_page(page)
-            page.goto(f"{self._base_url}/board", wait_until="domcontentloaded", timeout=60000)
         result = page.evaluate(self._browser_sign_script, sign_url)
         return self._decode_response(result["status"], result["body"])
 
@@ -413,31 +413,122 @@ class NodeSeekSign(_PluginBase):
         except Exception as e:
             return None, f"FlareSolverr 异常: {str(e)}"
 
+    def _solver_turnstile_token(self) -> str:
+        """用独立 FlareSolverr 会话取得令牌，不移植浏览器指纹或 CF Cookie。"""
+        import uuid
+        from html.parser import HTMLParser
+
+        class TokenParser(HTMLParser):
+            token = ""
+
+            def handle_starttag(self, tag, attrs):
+                values = dict(attrs)
+                if tag == "input" and values.get("name") == "cf-turnstile-response":
+                    self.token = values.get("value", "")
+
+        base = (getattr(settings, "FLARESOLVERR_URL", "") or "").rstrip("/")
+        if not base:
+            raise NodeSeekVerificationError("未配置 FlareSolverr")
+        api = base + "/v1"
+        sid = "nodeseek-" + uuid.uuid4().hex
+        create = {"cmd": "sessions.create", "session": sid}
+        proxy = self._browser_proxy()
+        if proxy:
+            create["proxy"] = {"url": proxy["server"]}
+            for key in ("username", "password"):
+                if proxy.get(key):
+                    create["proxy"][key] = proxy[key]
+        with requests.Session() as session:
+            # 服务连接不走站点代理；代理由 FlareSolverr 浏览器使用。
+            session.trust_env = False
+            def call(payload, timeout=75):
+                response = session.post(api, json=payload, timeout=timeout)
+                response.raise_for_status()
+                result = response.json()
+                if not isinstance(result, dict) or result.get("status") != "ok":
+                    raise NodeSeekVerificationError("FlareSolverr 请求未成功")
+                return result
+            try:
+                call(create, 30)
+                request = {"cmd": "request.get", "url": self._base_url + "/signIn.html",
+                           "session": sid, "maxTimeout": 60000}
+                call({**request, "waitInSeconds": 5})
+                # NodeSeek 当前桌面登录页：24 个可聚焦控件后为验证框。
+                solution = call({**request, "tabs_till_verify": 25}).get("solution") or {}
+                parser = TokenParser()
+                parser.feed(solution.get("response") or "")
+                token = solution.get("turnstile_token") or parser.token
+                if not isinstance(token, str) or not token:
+                    raise NodeSeekVerificationError("FlareSolverr 未返回验证令牌")
+                return token
+            finally:
+                try:
+                    session.post(api, json={"cmd": "sessions.destroy", "session": sid}, timeout=15)
+                except Exception:
+                    logger.warning("NodeSeek FlareSolverr 临时会话清理失败")
+
+    _solver_login_script = """async ({username, password, token}) => {
+        if (location.origin !== 'https://www.nodeseek.com') throw new Error('登录页面域名不匹配');
+        const moduleUrl = name => {
+            const element = Array.from(document.querySelectorAll('link[rel="modulepreload"]'))
+                .find(e => new URL(e.href).origin === location.origin &&
+                    new URL(e.href).pathname.startsWith('/assets/' + name + '-'));
+            if (!element) throw new Error('站点登录模块未找到');
+            return element.href;
+        };
+        const pre = await import(moduleUrl('preLogin'));
+        const post = await import(moduleUrl('postLogin'));
+        const response = await fetch('/api/account/signIn', {
+            method: 'POST', credentials: 'include', signal: AbortSignal.timeout(30000),
+            headers: {'content-type': 'application/json', ...await pre.g(),
+                      'x-captcha-token': token, 'x-captcha-source': 'turnstile'},
+            body: JSON.stringify({username, password})
+        });
+        await post.p(response);
+        let data = {};
+        try { data = await response.json(); } catch {}
+        return {status: response.status, success: data.success === true, need2FA: !!data.need2FA};
+    }"""
+
     def _login_in_page(self, page):
         """复用 MoviePilot 浏览器，登录后在同一个上下文内签到。"""
         if not self._username or not self._password:
             raise RuntimeError("未配置登录账号")
-        logger.info("NodeSeek 自动登录: 使用 MoviePilot 浏览器，打开 /signIn.html")
+        solver = bool(getattr(settings, "FLARESOLVERR_URL", ""))
+        token = None
+        if solver:
+            logger.info("NodeSeek 自动登录: 使用 FlareSolverr 完成登录页验证")
+            token = self._solver_turnstile_token()
         page.goto(f"{self._base_url}/signIn.html", wait_until="domcontentloaded", timeout=60000)
         page.wait_for_selector("#stacked-password", state="visible", timeout=30000)
-        logger.info("NodeSeek 自动登录: 登录表单已加载，等待站点验证")
-        page.fill("#stacked-email", self._username)
-        page.fill("#stacked-password", self._password)
-        # 只等待站点正常完成无交互验证，不尝试点击或绕过人工验证码。
-        try:
-            page.wait_for_function("""() => {
-                const field = document.querySelector('[name="cf-turnstile-response"]');
-                return !field || !!field.value;
-            }""", timeout=45000)
-        except Exception as e:
-            headings = page.evaluate("""() => Array.from(document.querySelectorAll('h3'))
-                .map(e => e.textContent).filter(t => /Cloudflare|验证/.test(t)).join(' ').slice(0,300)""")
-            logger.info(f"NodeSeek 验证诊断: {headings or '等待站点验证超时'}")
-            raise NodeSeekVerificationError() from e
-        logger.info("NodeSeek 自动登录: 站点验证已完成，提交登录")
-        page.click("form:has(#stacked-password) button[type='submit']")
-        page.wait_for_function("""() => Array.from(document.querySelectorAll('a'))
-            .some(a => a.textContent.trim() === '登出')""", timeout=30000)
+        if token:
+            # 保持 CloakBrowser 原生 UA / 指纹，等待站点初始化后提交新令牌。
+            page.wait_for_timeout(10000)
+            result = page.evaluate(self._solver_login_script, {
+                "username": self._username, "password": self._password, "token": token,
+            })
+            if result.get("need2FA"):
+                raise RuntimeError("账号要求二次验证，无法仅使用账号密码登录")
+            if not result.get("success"):
+                raise RuntimeError(f"账号登录未成功（HTTP {result.get('status')}）")
+            page.goto(self._base_url + "/", wait_until="domcontentloaded", timeout=60000)
+        else:
+            page.fill("#stacked-email", self._username)
+            page.fill("#stacked-password", self._password)
+            try:
+                page.wait_for_function("""() => {
+                    const field = document.querySelector('[name="cf-turnstile-response"]');
+                    return !field || !!field.value;
+                }""", timeout=45000)
+            except Exception as e:
+                raise NodeSeekVerificationError("登录页验证未完成") from e
+            page.click("form:has(#stacked-password) button[type='submit']")
+        # 退出入口可能只有图标，不能仅依赖“登出”文字。
+        page.wait_for_function("""() => !!document.querySelector('a[href="/api/account/signOut"]') ||
+            Array.from(document.querySelectorAll('a')).some(a => a.textContent.trim() === '登出')""",
+            timeout=30000)
+        if token:
+            page.wait_for_timeout(10000)
         # 不能把仅含 cf_clearance 的未登录上下文误记为登录成功。
         cookies = [c for c in page.context.cookies()
                    if c.get("domain", "").lstrip(".") in ("nodeseek.com", "www.nodeseek.com")]
@@ -474,7 +565,7 @@ class NodeSeekSign(_PluginBase):
                 data, error = self._sign_with_playwright(sign_url)
 
         if error == "login_verification":
-            error = "登录页 Cloudflare 验证未完成，请检查验证服务网络，或填写已登录的 Cookie"
+            error = "登录页 Cloudflare 验证未完成，请检查 FlareSolverr 版本、连接和站点代理"
         elif error == "browser_required":
             error = "站点拒绝签到（high risk action），请更新 Cookie 并确认浏览器验证已完成"
         elif error == "cf_challenge":

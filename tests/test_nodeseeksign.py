@@ -279,5 +279,83 @@ def test_expired_browser_session_relogs_in_same_page(monkeypatch):
     )
     monkeypatch.setattr(plugin, '_login_in_page', lambda p: events.append('login'))
     data, error = plugin._sign_in_page(page, plugin._sign_api)
-    assert events == ['board', 'login', 'board']
+    assert events == ['board', 'login']
     assert error is None and data['success'] is False
+
+
+def test_solver_session_proxy_token_and_cleanup(monkeypatch):
+    plugin = make_plugin()
+    monkeypatch.setattr(module.settings, 'FLARESOLVERR_URL', 'http://solver.test/', raising=False)
+    monkeypatch.setattr(module.settings, 'PROXY', {'https': 'http://user:secret@proxy.test:7890'})
+    calls = []
+    class Session:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def post(self, url, json, timeout):
+            assert url == 'http://solver.test/v1'
+            assert self.trust_env is False
+            calls.append(json)
+            result = {'status':'ok', 'solution':{'turnstile_token':'fixture-token'}}
+            return types.SimpleNamespace(raise_for_status=lambda:None, json=lambda:result)
+    monkeypatch.setattr(module.requests, 'Session', Session)
+    assert plugin._solver_turnstile_token() == 'fixture-token'
+    assert calls[0]['proxy'] == {'url':'http://proxy.test:7890','username':'user','password':'secret'}
+    assert [c['cmd'] for c in calls] == ['sessions.create','request.get','request.get','sessions.destroy']
+    assert calls[1]['waitInSeconds'] == 5
+    assert calls[2]['tabs_till_verify'] == 25
+    assert len({c['session'] for c in calls}) == 1
+    assert all('cookies' not in c for c in calls)
+
+
+def test_solver_ok_without_token_is_failure_and_session_destroyed(monkeypatch):
+    plugin = make_plugin()
+    monkeypatch.setattr(module.settings, 'FLARESOLVERR_URL', 'http://solver.test', raising=False)
+    monkeypatch.setattr(module.settings, 'PROXY', None)
+    calls=[]
+    class Session:
+        def __enter__(self): return self
+        def __exit__(self,*args): pass
+        def post(self,url,json,timeout):
+            calls.append(json['cmd'])
+            return types.SimpleNamespace(raise_for_status=lambda:None,json=lambda:{'status':'ok','solution':{'response':'<html></html>'}})
+    monkeypatch.setattr(module.requests,'Session',Session)
+    with pytest.raises(module.NodeSeekVerificationError): plugin._solver_turnstile_token()
+    assert calls[-1] == 'sessions.destroy'
+
+
+def test_solver_login_preserves_native_context_and_checks_account(monkeypatch):
+    plugin=make_plugin()
+    plugin._cookie=''
+    plugin._username,plugin._password='fixture-user','fixture-password'
+    monkeypatch.setattr(module.settings,'FLARESOLVERR_URL','http://solver.test',raising=False)
+    monkeypatch.setattr(plugin,'_solver_turnstile_token',lambda:'fixture-token')
+    events=[]
+    class Page:
+        context=types.SimpleNamespace(cookies=lambda:[{'name':'session','value':'new','domain':'.nodeseek.com'}])
+        def goto(self,url,**kwargs): events.append(url)
+        def wait_for_selector(self,*a,**kw): pass
+        def wait_for_timeout(self,*a): pass
+        def evaluate(self,script,args):
+            assert args=={'username':'fixture-user','password':'fixture-password','token':'fixture-token'}
+            assert 'modulepreload' in script and 'await post.p(response)' in script
+            return {'status':200,'success':True,'need2FA':False}
+        def wait_for_function(self,script,**kw):
+            assert '/api/account/signOut' in script
+            assert not plugin.saved_config
+    plugin._login_in_page(Page())
+    assert events==[plugin._base_url+'/signIn.html',plugin._base_url+'/']
+    assert plugin.saved_config['cookie']=='session=new'
+
+
+@pytest.mark.parametrize('result', [{'status':403,'success':False}, {'status':200,'success':True,'need2FA':True}])
+def test_rejected_solver_login_never_saves_session(monkeypatch,result):
+    plugin=make_plugin()
+    plugin._cookie=''
+    plugin._username,plugin._password='fixture-user','fixture-password'
+    monkeypatch.setattr(module.settings,'FLARESOLVERR_URL','http://solver.test',raising=False)
+    monkeypatch.setattr(plugin,'_solver_turnstile_token',lambda:'fixture-token')
+    page=types.SimpleNamespace(goto=lambda *a,**kw:None,wait_for_selector=lambda *a,**kw:None,
+                              wait_for_timeout=lambda *a:None,evaluate=lambda *a:result)
+    with pytest.raises(RuntimeError): plugin._login_in_page(page)
+    assert not plugin.saved_config
+    assert plugin._cookie==''
