@@ -1,6 +1,6 @@
 """
 NodeSeek 签到插件
-版本: 1.1.0
+版本: 1.2.2
 作者: liuyunfz
 功能:
 - 自动完成 NodeSeek 每日签到
@@ -37,7 +37,7 @@ class NodeSeekSign(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/favicon.ico"
     # 插件版本
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     # 插件作者
     plugin_author = "liuyunfz"
     # 作者主页
@@ -195,87 +195,100 @@ class NodeSeekSign(_PluginBase):
         return {
             "User-Agent": settings.USER_AGENT or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0",
             "Accept": "application/json, text/plain, */*",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Cookie": self._cookie,
             "Referer": f"{self._base_url}/board",
             "Origin": self._base_url,
         }
 
-    def _sign_direct(self, sign_url: str) -> Tuple[Optional[dict], Optional[str]]:
-        """
-        直接请求签到（不绕 CF）
-        """
+    @staticmethod
+    def _decode_response(status: int, body: str) -> Tuple[Optional[dict], Optional[str]]:
+        """保留非 2xx 的业务响应，区别站点风控与 Cloudflare HTML。"""
         try:
-            headers = self._build_headers()
-            response = requests.post(url=sign_url, headers=headers, timeout=30)
-            if response.status_code == 200:
-                data = response.json()
+            data = json.loads(body)
+        except (ValueError, TypeError):
+            data = None
+        if isinstance(data, dict):
+            if str(data.get("message", "")).lower() == "high risk action":
+                return None, "browser_required"
+            if isinstance(data.get("success"), bool):
                 return data, None
-            # 检测 CF 挑战
-            if response.status_code == 403 or under_challenge(response.text):
-                return None, "cf_challenge"
-            return None, f"HTTP {response.status_code}"
+        if under_challenge(body or "") or "Just a moment..." in (body or ""):
+            return None, "cf_challenge"
+        return None, f"HTTP {status}：签到接口未返回有效 JSON 业务结果"
+
+    def _sign_direct(self, sign_url: str) -> Tuple[Optional[dict], Optional[str]]:
+        try:
+            response = requests.post(
+                url=sign_url, headers=self._build_headers(),
+                proxies=settings.PROXY, timeout=30
+            )
+            return self._decode_response(response.status_code, response.text)
         except Exception as e:
-            return None, str(e)
+            return None, f"直连请求失败: {type(e).__name__}"
+
+    # 让站点自己的 Service Worker 接管请求，不能只搬运 cf_clearance 后用 requests POST。
+    # 同一段脚本也用于本地已登录浏览器的实站验证，不包含 Cookie 或账号信息。
+    _browser_sign_script = """async (signUrl) => {
+        if (location.origin !== "https://www.nodeseek.com") {
+            throw new Error("未进入 NodeSeek 页面");
+        }
+        const deadline = Date.now() + 30000;
+        while (!navigator.serviceWorker?.controller) {
+            if (Date.now() >= deadline) throw new Error("站点 Service Worker 未就绪");
+            await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        const response = await fetch(signUrl, {
+            method: "POST",
+            credentials: "include",
+            signal: AbortSignal.timeout(30000)
+        });
+        return {status: response.status, body: await response.text()};
+    }"""
+
+    def _browser_cookie_list(self) -> list:
+        cookies = {}
+        for part in (self._cookie or "").split(";"):
+            name, sep, value = part.strip().partition("=")
+            if sep and name:
+                cookies[name] = value
+        return [{"name": name, "value": value, "url": self._base_url}
+                for name, value in cookies.items()]
+
+    def _sign_in_page(self, page, sign_url: str):
+        # Cookie 必须在 context 的 cookie jar 内，Service Worker 发起的请求才会携带会话。
+        cookies = self._browser_cookie_list()
+        # 首页可能刚生成了新的 CF 通行 Cookie，不要用配置里的旧值覆盖它。
+        fresh_names = {c["name"] for c in page.context.cookies()
+                       if c.get("name") == "cf_clearance"
+                       and c.get("domain", "").lstrip(".") in ("nodeseek.com", "www.nodeseek.com")}
+        page.context.add_cookies([c for c in cookies if c["name"] not in fresh_names])
+        page.goto(f"{self._base_url}/board", wait_until="domcontentloaded", timeout=60000)
+        result = page.evaluate(self._browser_sign_script, sign_url)
+        return self._decode_response(result["status"], result["body"])
 
     def _sign_with_playwright(self, sign_url: str) -> Tuple[Optional[dict], Optional[str]]:
-        """
-        通过 Playwright 绕过 CF 后签到
-        """
         try:
             from app.helper.browser import PlaywrightHelper
-            helper = PlaywrightHelper()
-
-            result_data = [None]
-            error_msg = [None]
 
             def _do_sign(page):
-                """在 Playwright 页面中执行签到"""
-                # 先访问首页获取有效 cookie/session
-                page.goto(self._base_url, wait_until="networkidle", timeout=30000)
-                time.sleep(2)
-
-                # 在页面上下文中执行 fetch 签到
-                random_param = "true" if self._random_sign else "false"
-                api_url = f"{self._sign_api}?random={random_param}"
-
-                js_code = f"""
-                async () => {{
-                    const resp = await fetch("{api_url}", {{
-                        method: "POST",
-                        headers: {{
-                            "Accept": "application/json",
-                            "Referer": "{self._base_url}/board"
-                        }},
-                        credentials: "include"
-                    }});
-                    return await resp.json();
-                }}
-                """
                 try:
-                    data = page.evaluate(js_code)
-                    result_data[0] = data
+                    return self._sign_in_page(page, sign_url)
                 except Exception as e:
-                    error_msg[0] = f"JS执行失败: {str(e)}"
+                    logger.warning(f"NodeSeek 浏览器签到失败: {type(e).__name__}")
+                    return None, "浏览器签到失败，请检查登录会话、站点验证及浏览器运行日志"
 
-            helper.action(
-                url=self._base_url,
-                callback=_do_sign,
-                cookies=self._cookie,
-                proxies=settings.PROXY,
-                headless=True,
-                timeout=60
+            # 不把认证信息放进全局 HTTP Header，避免第三方资源收到 Cookie；
+            # 由回调向 NodeSeek 域名注入，再访问签到页。
+            result = PlaywrightHelper().action(
+                url=self._base_url, callback=_do_sign,
+                proxies=settings.PROXY, headless=True, timeout=60
             )
-
-            if result_data[0]:
-                return result_data[0], None
-            return None, error_msg[0] or "Playwright签到失败"
-
+            return result or (None, "MoviePilot 浏览器未能打开 NodeSeek，请检查浏览器组件及网络")
         except ImportError:
-            return None, "Playwright未安装，请先安装: pip install playwright && playwright install chromium"
+            return None, "MoviePilot 浏览器组件不可用，请检查主程序浏览器配置"
         except Exception as e:
-            return None, f"Playwright异常: {str(e)}"
+            return None, f"浏览器异常: {type(e).__name__}"
 
     def _sign_with_flaresolverr(self, sign_url: str) -> Tuple[Optional[dict], Optional[str]]:
         """
@@ -299,8 +312,9 @@ class NodeSeekSign(_PluginBase):
 
             # 合并 cookie
             fs_cookies = solution.get("cookies", [])
-            fs_cookie_str = "; ".join([f"{c.get('name')}={c.get('value')}" for c in fs_cookies if c.get('name')])
-            merged_cookie = f"{self._cookie}; {fs_cookie_str}" if self._cookie else fs_cookie_str
+            merged = {c["name"]: c["value"] for c in self._browser_cookie_list()}
+            merged.update({c["name"]: c.get("value", "") for c in fs_cookies if c.get("name")})
+            merged_cookie = "; ".join(f"{name}={value}" for name, value in merged.items())
 
             fs_ua = solution.get("userAgent") or settings.USER_AGENT
 
@@ -312,10 +326,8 @@ class NodeSeekSign(_PluginBase):
                 "Origin": self._base_url,
             }
 
-            response = requests.post(url=sign_url, headers=headers, timeout=30)
-            if response.status_code == 200:
-                return response.json(), None
-            return None, f"FlareSolverr 签到失败: HTTP {response.status_code}"
+            response = requests.post(url=sign_url, headers=headers, proxies=settings.PROXY, timeout=30)
+            return self._decode_response(response.status_code, response.text)
 
         except Exception as e:
             return None, f"FlareSolverr 异常: {str(e)}"
@@ -632,31 +644,23 @@ class NodeSeekSign(_PluginBase):
         random_param = "true" if self._random_sign else "false"
         sign_url = f"{self._sign_api}?random={random_param}"
 
-        # 按优先级尝试签到方式
-        data = None
-        error = None
-
-        # 1. 先尝试直接请求
         logger.info(f"NodeSeek 签到 - 模式: {self._cf_mode}")
-        data, error = self._sign_direct(sign_url)
-
-        # 2. 如果遇到 CF 挑战，根据配置选择绕过方式
-        if error == "cf_challenge":
-            logger.info("NodeSeek 签到 - 检测到 Cloudflare 挑战，尝试绕过...")
-            self._save_history("CF挑战", "检测到Cloudflare防护，尝试绕过")
-
-            if self._cf_mode == "playwright":
+        if self._cf_mode == "playwright":
+            data, error = self._sign_with_playwright(sign_url)
+        elif self._cf_mode == "flaresolverr":
+            data, error = self._sign_with_flaresolverr(sign_url)
+            if error in ("cf_challenge", "browser_required"):
                 data, error = self._sign_with_playwright(sign_url)
-            elif self._cf_mode == "flaresolverr":
-                data, error = self._sign_with_flaresolverr(sign_url)
-            else:
-                # direct 模式下遇到 CF，自动尝试 Playwright
-                logger.info("NodeSeek 签到 - 自动切换到 Playwright 模式")
+        else:
+            data, error = self._sign_direct(sign_url)
+            if error in ("cf_challenge", "browser_required"):
+                logger.info("NodeSeek 需要浏览器会话，切换浏览器签到")
                 data, error = self._sign_with_playwright(sign_url)
-                # 如果 Playwright 也失败，尝试 FlareSolverr
-                if error and settings.FLARESOLVERR_URL:
-                    logger.info("NodeSeek 签到 - Playwright 失败，尝试 FlareSolverr")
-                    data, error = self._sign_with_flaresolverr(sign_url)
+
+        if error == "browser_required":
+            error = "站点拒绝签到（high risk action），请更新 Cookie 并确认浏览器验证已完成"
+        elif error == "cf_challenge":
+            error = "Cloudflare 验证未通过，请检查 MoviePilot 浏览器环境"
 
         # 处理结果
         if error:
@@ -670,13 +674,13 @@ class NodeSeekSign(_PluginBase):
             return
 
         success = data.get("success", False)
-        message = data.get("message", "未知状态")
+        message = str(data.get("message") or "未知状态")
 
         if success:
             logger.info(f"NodeSeek 签到成功: {message}")
             self._save_history("签到成功", message)
             self._send_notification("NodeSeek签到成功", f"✅ {message}")
-        elif "已经签到" in message or "重复" in message:
+        elif any(text in message for text in ("已经签到", "已签到", "重复签到", "今天已完成签到")):
             logger.info(f"NodeSeek 已签到: {message}")
             self._save_history("已签到", message)
             self._send_notification("NodeSeek已签到", f"ℹ️ {message}")
@@ -860,10 +864,10 @@ class NodeSeekSign(_PluginBase):
                                                         "label": "CF绕过模式",
                                                         "items": [
                                                             {"title": "自动（先直连，失败自动切换）", "value": "direct"},
-                                                            {"title": "Playwright（需安装浏览器）", "value": "playwright"},
+                                                            {"title": "浏览器会话（MoviePilot 浏览器组件）", "value": "playwright"},
                                                             {"title": "FlareSolverr（需配置服务地址）", "value": "flaresolverr"}
                                                         ],
-                                                        "hint": "自动模式下优先直连，遇到CF挑战自动用Playwright/FlareSolverr"
+                                                        "hint": "自动模式遇到站点风控或CF挑战会切换浏览器；推荐浏览器会话模式"
                                                     }
                                                 }]
                                             },
