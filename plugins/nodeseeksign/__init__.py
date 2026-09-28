@@ -1,6 +1,6 @@
 """
 NodeSeek 签到插件
-版本: 1.2.2
+版本: 1.2.3
 作者: liuyunfz
 功能:
 - 自动完成 NodeSeek 每日签到
@@ -11,11 +11,11 @@ NodeSeek 签到插件
 - 集成 MoviePilot PlaywrightHelper 绕过 Cloudflare
 - 支持 FlareSolverr 模式
 """
-import time
 import requests
 import re
 import json
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit, unquote
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -29,6 +29,10 @@ from app.log import logger
 from app.schemas import NotificationType
 
 
+class NodeSeekVerificationError(RuntimeError):
+    """登录表单的站点验证尚未就绪，尚未提交账号密码。"""
+
+
 class NodeSeekSign(_PluginBase):
     # 插件名称
     plugin_name = "NodeSeek签到"
@@ -37,7 +41,7 @@ class NodeSeekSign(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/favicon.ico"
     # 插件版本
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     # 插件作者
     plugin_author = "liuyunfz"
     # 作者主页
@@ -149,7 +153,7 @@ class NodeSeekSign(_PluginBase):
             self._history_days = self._to_int(self._cfg(config, "history_days", self._history_days), 30)
             self._cf_mode = self._cfg(config, "cf_mode", self._cf_mode) or "direct"
             self._username = (self._cfg(config, "username", self._username) or "").strip()
-            self._password = (self._cfg(config, "password", self._password) or "").strip()
+            self._password = self._cfg(config, "password", self._password) or ""
             if self._max_retries < 0:
                 self._max_retries = 3
             if self._retry_interval < 1:
@@ -263,30 +267,107 @@ class NodeSeekSign(_PluginBase):
                        if c.get("name") == "cf_clearance"
                        and c.get("domain", "").lstrip(".") in ("nodeseek.com", "www.nodeseek.com")}
         page.context.add_cookies([c for c in cookies if c["name"] not in fresh_names])
+        had_cookie = bool(self._cookie)
+        if not had_cookie:
+            self._login_in_page(page)
         page.goto(f"{self._base_url}/board", wait_until="domcontentloaded", timeout=60000)
+        if had_cookie and self._username and self._password and page.query_selector('a[href="/signIn.html"]'):
+            logger.info("NodeSeek 登录会话已失效，在浏览器中重新登录")
+            self._login_in_page(page)
+            page.goto(f"{self._base_url}/board", wait_until="domcontentloaded", timeout=60000)
         result = page.evaluate(self._browser_sign_script, sign_url)
         return self._decode_response(result["status"], result["body"])
 
+    @staticmethod
+    def _browser_proxy():
+        """MoviePilot 的 requests 代理字典需转换为浏览器的 server 格式。"""
+        proxy = settings.PROXY
+        if not proxy:
+            return None
+        if isinstance(proxy, dict) and proxy.get("server"):
+            return dict(proxy)
+        address = (proxy.get("https") or proxy.get("http")) if isinstance(proxy, dict) else proxy
+        if not address:
+            return None
+        parsed = urlsplit(address if "://" in address else f"http://{address}")
+        host = parsed.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        result = {"server": f"{parsed.scheme}://{host}" + (f":{parsed.port}" if parsed.port else "")}
+        if parsed.username is not None:
+            result["username"] = unquote(parsed.username)
+        if parsed.password is not None:
+            result["password"] = unquote(parsed.password)
+        return result
+
+    def _run_browser(self, callback):
+        try:
+            from cloakbrowser import launch_context
+        except ModuleNotFoundError as e:
+            if e.name != "cloakbrowser":
+                raise
+            # 兼容尚未迁移 CloakBrowser 的旧版 MoviePilot。
+            from app.helper.browser import PlaywrightHelper
+            return PlaywrightHelper().action(
+                url=self._base_url, callback=callback,
+                proxies=self._browser_proxy(), headless=True, timeout=60
+            )
+        # 复用主程序已安装的运行时，避免全局 FlareSolverr 选项强制调用可选服务。
+        configured_proxy = self._browser_proxy()
+        routes = [configured_proxy, None] if configured_proxy else [None]
+        for proxy in routes:
+            context = launch_context(
+                headless=True, proxy=proxy,
+                humanize=getattr(settings, "CLOAKBROWSER_HUMANIZE", False),
+                human_preset=getattr(settings, "CLOAKBROWSER_HUMAN_PRESET", "default"),
+            )
+            try:
+                page = context.new_page()
+                def request_failed(request):
+                    host = urlsplit(request.url).hostname
+                    if host == "challenges.cloudflare.com":
+                        logger.info(f"NodeSeek 验证资源请求失败: {host}, {request.failure}")
+                page.on("requestfailed", request_failed)
+                page.goto(self._base_url, wait_until="domcontentloaded", timeout=60000)
+                result = callback(page)
+                if result and result[1] == "login_verification" and proxy:
+                    logger.info("NodeSeek 登录验证未加载，尝试不使用代理的浏览器连接（尚未提交账号密码）")
+                    continue
+                return result
+            finally:
+                context.close()
+
+
     def _sign_with_playwright(self, sign_url: str) -> Tuple[Optional[dict], Optional[str]]:
         try:
-            from app.helper.browser import PlaywrightHelper
+            from importlib.metadata import version, PackageNotFoundError
+            components = []
+            for name in ("playwright", "cf_clearance", "cloakbrowser"):
+                try:
+                    installed = version(name.replace("_", "-"))
+                except PackageNotFoundError:
+                    installed = "未安装"
+                components.append(f"{name}={installed}")
+            logger.info("NodeSeek 浏览器环境: " + ", ".join(components)
+                        + f", browser_emulation={getattr(settings, 'BROWSER_EMULATION', '默认')}")
 
             def _do_sign(page):
                 try:
                     return self._sign_in_page(page, sign_url)
+                except NodeSeekVerificationError:
+                    logger.info("NodeSeek 登录页验证未完成，账号密码尚未提交")
+                    return None, "login_verification"
                 except Exception as e:
-                    logger.warning(f"NodeSeek 浏览器签到失败: {type(e).__name__}")
+                    logger.warning(f"NodeSeek 浏览器签到失败: {type(e).__name__}, "
+                                   f"页面={page.url.split('?')[0]}, title={page.title()}")
                     return None, "浏览器签到失败，请检查登录会话、站点验证及浏览器运行日志"
 
             # 不把认证信息放进全局 HTTP Header，避免第三方资源收到 Cookie；
             # 由回调向 NodeSeek 域名注入，再访问签到页。
-            result = PlaywrightHelper().action(
-                url=self._base_url, callback=_do_sign,
-                proxies=settings.PROXY, headless=True, timeout=60
-            )
+            result = self._run_browser(_do_sign)
             return result or (None, "MoviePilot 浏览器未能打开 NodeSeek，请检查浏览器组件及网络")
-        except ImportError:
-            return None, "MoviePilot 浏览器组件不可用，请检查主程序浏览器配置"
+        except ImportError as e:
+            return None, f"MoviePilot 浏览器依赖不可用: {getattr(e, 'name', None) or type(e).__name__}"
         except Exception as e:
             return None, f"浏览器异常: {type(e).__name__}"
 
@@ -304,7 +385,7 @@ class NodeSeekSign(_PluginBase):
             solution = helper._PlaywrightHelper__flaresolverr_request(
                 url=self._base_url,
                 cookies=self._cookie,
-                proxy_config=settings.PROXY,
+                proxy_config=self._browser_proxy(),
                 timeout=60
             )
             if not solution:
@@ -332,278 +413,39 @@ class NodeSeekSign(_PluginBase):
         except Exception as e:
             return None, f"FlareSolverr 异常: {str(e)}"
 
-    def _auto_login(self) -> Optional[str]:
-        """
-        通过 Playwright 浏览器自动化登录 NodeSeek 获取 Cookie
-        NS 无公开登录 API，只能通过浏览器表单提交
-        """
+    def _login_in_page(self, page):
+        """复用 MoviePilot 浏览器，登录后在同一个上下文内签到。"""
         if not self._username or not self._password:
-            logger.warning("未配置用户名或密码，无法自动登录")
-            return None
-
+            raise RuntimeError("未配置登录账号")
+        logger.info("NodeSeek 自动登录: 使用 MoviePilot 浏览器，打开 /signIn.html")
+        page.goto(f"{self._base_url}/signIn.html", wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_selector("#stacked-password", state="visible", timeout=30000)
+        logger.info("NodeSeek 自动登录: 登录表单已加载，等待站点验证")
+        page.fill("#stacked-email", self._username)
+        page.fill("#stacked-password", self._password)
+        # 只等待站点正常完成无交互验证，不尝试点击或绕过人工验证码。
         try:
-            from playwright.sync_api import sync_playwright
-            from cf_clearance import sync_cf_retry, sync_stealth
-            logger.info("NodeSeek 自动登录: 启动 Playwright")
-
-            proxy = None
-            try:
-                pxy = settings.PROXY or {}
-                server = pxy.get('http') or pxy.get('https')
-                if server:
-                    proxy = {"server": server}
-            except Exception:
-                proxy = None
-
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True, proxy=proxy) if proxy else pw.chromium.launch(headless=True)
-                context = browser.new_context()
-                page = context.new_page()
-
-                # 过 CF
-                sync_stealth(page, pure=True)
-                login_url = f"{self._base_url}/login"
-                page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
-
-                try:
-                    cf_ok, _ = sync_cf_retry(page)
-                    if cf_ok:
-                        logger.info("NodeSeek 自动登录: CF 验证通过")
-                except Exception:
-                    pass
-
-                time.sleep(2)
-
-                # CF 通过后必须确认真正进入登录表单；sync_cf_retry 有时会误报成功但仍停在
-                # Cloudflare/Turnstile 的 "Just a moment..." 页，此时页面里只有隐藏的
-                # cf-turnstile-response，继续填表必然 username/password 都失败。
-                login_form_ready = False
-                last_inputs = []
-                for attempt in range(1, 5):
-                    try:
-                        title = page.title()
-                        url = page.url
-                        last_inputs = page.evaluate("""
-                        () => Array.from(document.querySelectorAll('input')).map((i, idx) => ({
-                            idx,
-                            type: i.type || '',
-                            name: i.name || '',
-                            placeholder: i.placeholder || '',
-                            autocomplete: i.autocomplete || '',
-                            visible: !!(i.offsetWidth || i.offsetHeight || i.getClientRects().length)
-                        }))
-                        """)
-                        has_password = page.locator("input[type='password']").count() > 0
-                        logger.info(f"NodeSeek 自动登录: 登录页检查 {attempt}/4 title={title}, url={url}, has_password={has_password}")
-                        if has_password:
-                            login_form_ready = True
-                            break
-
-                        # 如果仍是 CF 页，不要直接提交；等待/重试，让浏览器完成挑战跳转。
-                        input_names = [i.get("name") for i in (last_inputs or [])]
-                        still_cf = (
-                            "just a moment" in (title or "").lower()
-                            or "cf-turnstile-response" in input_names
-                            or not last_inputs
-                        )
-                        if still_cf:
-                            logger.warning(f"NodeSeek 自动登录: 仍在 CF 验证页或登录表单未出现，输入框: {last_inputs}")
-                            try:
-                                cf_ok, _ = sync_cf_retry(page)
-                                if cf_ok:
-                                    logger.info("NodeSeek 自动登录: CF 重试返回通过")
-                            except Exception as e:
-                                logger.debug(f"NodeSeek 自动登录: CF 重试异常: {e}")
-                            page.wait_for_timeout(5000)
-                            if "/login" not in page.url:
-                                page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
-                            else:
-                                page.reload(wait_until="domcontentloaded", timeout=30000)
-                            continue
-
-                        # 不是 CF 页但也没密码框，尝试重新打开登录页。
-                        if "/login" not in url:
-                            page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
-                        else:
-                            page.wait_for_timeout(3000)
-                    except Exception as e:
-                        logger.debug(f"NodeSeek 自动登录: 登录页检查失败: {e}")
-                        try:
-                            page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
-                        except Exception:
-                            pass
-
-                if not login_form_ready:
-                    logger.error(f"NodeSeek 自动登录失败: CF 未真正放行或登录表单未加载，最后输入框: {last_inputs}")
-                    try:
-                        browser.close()
-                    except Exception:
-                        pass
-                    return None
-
-                # 等待登录表单出现。NodeSeek 前端的 username 输入框可能只是 type=text，未必带 name/placeholder。
-                try:
-                    page.wait_for_selector("input[type='password']", timeout=15000)
-                except Exception:
-                    try:
-                        input_info = page.evaluate("""
-                        () => Array.from(document.querySelectorAll('input')).map((i, idx) => ({
-                            idx,
-                            type: i.type || '',
-                            name: i.name || '',
-                            placeholder: i.placeholder || '',
-                            autocomplete: i.autocomplete || '',
-                            visible: !!(i.offsetWidth || i.offsetHeight || i.getClientRects().length)
-                        }))
-                        """)
-                        logger.warning(f"NodeSeek 自动登录: 未发现密码输入框，当前输入框: {input_info}")
-                    except Exception:
-                        pass
-
-                username_filled = False
-                password_filled = False
-
-                # 填写用户名/邮箱：先精确选择，再兜底选择第一个可见的非 password/hidden 输入框
-                username_selectors = [
-                    "input[name='username']", "input[name='email']", "input[name='account']",
-                    "input[name='login']", "input[type='email']", "input[autocomplete='username']",
-                    "input[placeholder*='邮箱']", "input[placeholder*='email']", "input[placeholder*='Email']",
-                    "input[placeholder*='用户']", "input[placeholder*='账号']", "input[type='text']",
-                    "input:not([type])"
-                ]
-                for sel in username_selectors:
-                    try:
-                        loc = page.locator(sel).first
-                        if loc.count() > 0 and loc.is_visible():
-                            loc.fill(self._username)
-                            username_filled = True
-                            logger.info(f"NodeSeek 自动登录: 已填写用户名 ({sel})")
-                            break
-                    except Exception:
-                        continue
-
-                if not username_filled:
-                    try:
-                        filled = page.evaluate("""
-                        (username) => {
-                            const inputs = Array.from(document.querySelectorAll('input'));
-                            const target = inputs.find(i => {
-                                const type = (i.type || '').toLowerCase();
-                                const visible = !!(i.offsetWidth || i.offsetHeight || i.getClientRects().length);
-                                return visible && !['password','hidden','checkbox','radio','submit','button'].includes(type) && !i.disabled && !i.readOnly;
-                            });
-                            if (!target) return false;
-                            target.focus();
-                            target.value = username;
-                            target.dispatchEvent(new Event('input', {bubbles: true}));
-                            target.dispatchEvent(new Event('change', {bubbles: true}));
-                            return true;
-                        }
-                        """, self._username)
-                        if filled:
-                            username_filled = True
-                            logger.info("NodeSeek 自动登录: 已通过 JS 兜底填写用户名")
-                    except Exception as e:
-                        logger.debug(f"NodeSeek 自动登录: JS 兜底填写用户名失败: {e}")
-
-                # 填写密码
-                password_selectors = [
-                    "input[name='password']", "input[type='password']", "input[autocomplete='current-password']",
-                    "input[placeholder*='密码']", "input[placeholder*='Password']", "input[placeholder*='password']"
-                ]
-                for sel in password_selectors:
-                    try:
-                        loc = page.locator(sel).first
-                        if loc.count() > 0 and loc.is_visible():
-                            loc.fill(self._password)
-                            password_filled = True
-                            logger.info(f"NodeSeek 自动登录: 已填写密码 ({sel})")
-                            break
-                    except Exception:
-                        continue
-
-                if not password_filled:
-                    logger.warning("NodeSeek 自动登录: 未能填写密码，登录表单可能未加载或选择器变化")
-
-                if not username_filled or not password_filled:
-                    logger.warning(f"NodeSeek 自动登录: 表单填写不完整 username_filled={username_filled}, password_filled={password_filled}")
-
-                # 点击登录；如果按钮选择器变化，最后用 Enter 提交
-                clicked = False
-                submit_selectors = [
-                    "button[type='submit']", "input[type='submit']", "button:has-text('登录')",
-                    "button:has-text('Login')", "button:has-text('Sign in')", "button:has-text('Log in')",
-                    "button:has-text('提交')", "form button", "[role='button']:has-text('登录')",
-                    "[role='button']:has-text('Login')"
-                ]
-                for sel in submit_selectors:
-                    try:
-                        loc = page.locator(sel).first
-                        if loc.count() > 0 and loc.is_visible():
-                            loc.click()
-                            clicked = True
-                            logger.info(f"NodeSeek 自动登录: 已点击登录 ({sel})")
-                            break
-                    except Exception:
-                        continue
-                if not clicked:
-                    try:
-                        page.keyboard.press("Enter")
-                        clicked = True
-                        logger.info("NodeSeek 自动登录: 已通过 Enter 提交登录表单")
-                    except Exception as e:
-                        logger.warning(f"NodeSeek 自动登录: 提交登录表单失败: {e}")
-
-                # 等待跳转/接口完成
-                try:
-                    page.wait_for_load_state("networkidle", timeout=20000)
-                except Exception:
-                    time.sleep(5)
-                try:
-                    page.wait_for_timeout(3000)
-                    logger.info(f"NodeSeek 自动登录: 提交后 title={page.title()}, url={page.url}")
-                except Exception:
-                    pass
-
-                # 某些 SPA 登录成功后停在原页，主动访问 board 促使会话 cookie 写入/校验
-                try:
-                    if "/login" in page.url:
-                        page.goto(f"{self._base_url}/board", wait_until="domcontentloaded", timeout=15000)
-                        page.wait_for_timeout(2000)
-                except Exception:
-                    pass
-
-                # 提取所有 cookies
-                all_cookies = context.cookies()
-                cookie_parts = []
-                cookie_names = []
-                for c in all_cookies:
-                    domain = c.get('domain', '')
-                    name = c.get('name', '')
-                    if domain.endswith('nodeseek.com') or domain.endswith('.nodeseek.com'):
-                        cookie_names.append(name)
-                        cookie_parts.append(f"{name}={c.get('value', '')}")
-
-                browser.close()
-
-                if cookie_parts:
-                    cookie_str = "; ".join(cookie_parts)
-                    # NodeSeek 的会话 cookie 名称可能随后端框架变化，不强制要求叫 session/token；
-                    # 只要登录后有站点 cookie，就交给后续签到接口验证是否有效。
-                    logger.info(f"NodeSeek 自动登录成功，获取到 {len(cookie_parts)} 个 cookie: {cookie_names}")
-                    return cookie_str
-                else:
-                    try:
-                        logger.warning(f"NodeSeek 自动登录: 未获取到任何 nodeseek.com cookie，浏览器 cookie 名称: {[c.get('name') for c in all_cookies]}")
-                    except Exception:
-                        logger.warning("NodeSeek 自动登录: 未获取到任何 cookie")
-
-        except ImportError:
-            logger.error("Playwright 未安装，无法使用浏览器自动登录")
+            page.wait_for_function("""() => {
+                const field = document.querySelector('[name="cf-turnstile-response"]');
+                return !field || !!field.value;
+            }""", timeout=45000)
         except Exception as e:
-            logger.error(f"NodeSeek 自动登录异常: {e}")
-
-        return None
+            headings = page.evaluate("""() => Array.from(document.querySelectorAll('h3'))
+                .map(e => e.textContent).filter(t => /Cloudflare|验证/.test(t)).join(' ').slice(0,300)""")
+            logger.info(f"NodeSeek 验证诊断: {headings or '等待站点验证超时'}")
+            raise NodeSeekVerificationError() from e
+        logger.info("NodeSeek 自动登录: 站点验证已完成，提交登录")
+        page.click("form:has(#stacked-password) button[type='submit']")
+        page.wait_for_function("""() => Array.from(document.querySelectorAll('a'))
+            .some(a => a.textContent.trim() === '登出')""", timeout=30000)
+        # 不能把仅含 cf_clearance 的未登录上下文误记为登录成功。
+        cookies = [c for c in page.context.cookies()
+                   if c.get("domain", "").lstrip(".") in ("nodeseek.com", "www.nodeseek.com")]
+        if not cookies:
+            raise RuntimeError("登录后没有站点会话")
+        self._cookie = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+        self._save_current_config()
+        logger.info("NodeSeek 自动登录成功：已验证登录状态并更新 Cookie，继续在当前浏览器签到")
 
     def sign(self, retry_count=0):
         """
@@ -611,41 +453,15 @@ class NodeSeekSign(_PluginBase):
         """
         logger.info("开始 NodeSeek 签到")
 
-        if not self._cookie:
-            if self._username and self._password:
-                logger.info("NodeSeek 签到: 未配置Cookie，尝试自动登录")
-                new_cookie = self._auto_login()
-                if new_cookie:
-                    self._cookie = new_cookie
-                    self.update_config({
-                        "enabled": self._enabled,
-                        "cookie": self._cookie,
-                        "notify": self._notify,
-                        "random_sign": self._random_sign,
-                        "cron": self._cron,
-                        "max_retries": self._max_retries,
-                        "retry_interval": self._retry_interval,
-                        "history_days": self._history_days,
-                        "cf_mode": self._cf_mode,
-                        "username": self._username,
-                        "password": self._password,
-                    })
-                else:
-                    logger.error("NodeSeek 签到失败: 自动登录失败")
-                    self._save_history("签到失败", "自动登录失败，请检查用户名和密码")
-                    self._send_notification("NodeSeek签到失败", "❗ 自动登录失败，请检查用户名和密码")
-                    return
-            else:
-                logger.error("NodeSeek 签到失败: 未配置Cookie")
-                self._save_history("签到失败", "未配置Cookie")
-                self._send_notification("NodeSeek签到失败", "❗ 未配置Cookie，请填写Cookie或用户名密码")
-                return
-
         random_param = "true" if self._random_sign else "false"
         sign_url = f"{self._sign_api}?random={random_param}"
+        if not self._cookie and not (self._username and self._password):
+            self._save_history("签到失败", "未配置 Cookie 或用户名密码")
+            self._send_notification("NodeSeek签到失败", "❗ 请填写 Cookie 或用户名密码")
+            return
 
         logger.info(f"NodeSeek 签到 - 模式: {self._cf_mode}")
-        if self._cf_mode == "playwright":
+        if not self._cookie or self._cf_mode == "playwright":
             data, error = self._sign_with_playwright(sign_url)
         elif self._cf_mode == "flaresolverr":
             data, error = self._sign_with_flaresolverr(sign_url)
@@ -657,7 +473,9 @@ class NodeSeekSign(_PluginBase):
                 logger.info("NodeSeek 需要浏览器会话，切换浏览器签到")
                 data, error = self._sign_with_playwright(sign_url)
 
-        if error == "browser_required":
+        if error == "login_verification":
+            error = "登录页 Cloudflare 验证未完成，请检查验证服务网络，或填写已登录的 Cookie"
+        elif error == "browser_required":
             error = "站点拒绝签到（high risk action），请更新 Cookie 并确认浏览器验证已完成"
         elif error == "cf_challenge":
             error = "Cloudflare 验证未通过，请检查 MoviePilot 浏览器环境"

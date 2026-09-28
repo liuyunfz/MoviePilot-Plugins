@@ -161,3 +161,123 @@ def test_flaresolverr_site_risk_uses_browser(monkeypatch):
     monkeypatch.setattr(plugin, '_sign_with_playwright', lambda url: ({'success': True, 'message': '签到成功'}, None))
     plugin.sign()
     assert plugin.get_data('history')[-1]['status'] == '签到成功'
+
+
+@pytest.mark.parametrize('proxy,expected', [
+    ({}, None),
+    ({'http': 'http://proxy.test:7890', 'https': 'http://proxy.test:7890'}, {'server': 'http://proxy.test:7890'}),
+    ({'server': 'socks5://proxy.test:1080'}, {'server': 'socks5://proxy.test:1080'}),
+    ({'https': 'http://alice:p%40ss@[::1]:7890'}, {'server': 'http://[::1]:7890', 'username': 'alice', 'password': 'p@ss'}),
+])
+def test_browser_proxy_conversion(monkeypatch, proxy, expected):
+    monkeypatch.setattr(module.settings, 'PROXY', proxy)
+    assert module.NodeSeekSign._browser_proxy() == expected
+
+
+def test_missing_cookie_auto_mode_uses_browser_login(monkeypatch):
+    plugin = make_plugin('direct')
+    plugin._cookie = ''
+    plugin._username = 'fixture-user'
+    plugin._password = 'fixture-password'
+    monkeypatch.setattr(plugin, '_sign_direct', lambda url: pytest.fail('no session must log in first'))
+    monkeypatch.setattr(plugin, '_sign_with_playwright', lambda url: ({'success': False, 'message': '今天已完成签到，请勿重复操作'}, None))
+    plugin.sign()
+    assert plugin.get_data('history')[-1]['status'] == '已签到'
+
+
+def test_cloak_runtime_ignores_optional_global_solver_and_closes(monkeypatch):
+    plugin = make_plugin()
+    monkeypatch.setattr(module.settings, 'PROXY', {'https': 'http://proxy.test:7890'})
+    monkeypatch.setattr(module.settings, 'BROWSER_EMULATION', 'flaresolverr', raising=False)
+    events = []
+    page = types.SimpleNamespace(goto=lambda *args, **kwargs: events.append('goto'), on=lambda *args: None)
+    context = types.SimpleNamespace(new_page=lambda: page, close=lambda: events.append('close'))
+    def launch_context(**kwargs):
+        assert kwargs['proxy'] == {'server': 'http://proxy.test:7890'}
+        return context
+    monkeypatch.setitem(sys.modules, 'cloakbrowser', types.SimpleNamespace(launch_context=launch_context))
+    def callback(p):
+        assert p is page
+        raise RuntimeError('fixture failure')
+    with pytest.raises(RuntimeError, match='fixture failure'):
+        plugin._run_browser(callback)
+    assert events == ['goto', 'close']
+
+
+def test_login_uses_real_entry_and_validates_before_saving():
+    plugin = make_plugin()
+    plugin._username = 'fixture-user'
+    plugin._password = 'fixture-password'
+    events = []
+    class Page:
+        context = types.SimpleNamespace(cookies=lambda: [
+            {'name': 'session', 'value': 'fixture-session', 'domain': '.nodeseek.com'},
+            {'name': 'other', 'value': 'fixture-other', 'domain': 'badnodeseek.com'},
+        ])
+        def goto(self, url, **kwargs):
+            assert url == plugin._base_url + '/signIn.html'
+            events.append('navigate')
+        def wait_for_selector(self, selector, **kwargs):
+            assert selector == '#stacked-password'
+        def fill(self, selector, value):
+            assert (selector, value) in [('#stacked-email', 'fixture-user'), ('#stacked-password', 'fixture-password')]
+        def wait_for_function(self, script, **kwargs):
+            if '登出' in script:
+                assert events[-1] == 'submit'
+                assert not plugin.saved_config
+                events.append('verified')
+        def click(self, selector):
+            assert 'submit' in selector
+            events.append('submit')
+    plugin._login_in_page(Page())
+    assert events == ['navigate', 'submit', 'verified']
+    assert plugin.saved_config['cookie'] == 'session=fixture-session'
+    assert plugin.saved_config['random_sign'] is False
+
+
+def test_verification_failure_does_not_submit_or_save():
+    plugin = make_plugin()
+    plugin._cookie = ''
+    plugin._username, plugin._password = 'fixture-user', 'fixture-password'
+    class Page:
+        def goto(self, *args, **kwargs): pass
+        def wait_for_selector(self, *args, **kwargs): pass
+        def fill(self, *args, **kwargs): pass
+        def wait_for_function(self, *args, **kwargs): raise TimeoutError()
+        def evaluate(self, *args): return 'Cloudflare人机验证服务加载失败'
+        def click(self, *args): pytest.fail('must not submit while verification is unavailable')
+    with pytest.raises(module.NodeSeekVerificationError):
+        plugin._login_in_page(Page())
+    assert plugin._cookie == ''
+    assert not plugin.saved_config
+
+
+def test_verification_timeout_can_retry_direct_before_login(monkeypatch):
+    plugin = make_plugin()
+    monkeypatch.setattr(module.settings, 'PROXY', {'https': 'http://proxy.test:7890'})
+    routes, closed = [], []
+    page = types.SimpleNamespace(goto=lambda *a, **kw: None, on=lambda *a: None)
+    def launch_context(**kwargs):
+        routes.append(kwargs['proxy'])
+        return types.SimpleNamespace(new_page=lambda: page, close=lambda: closed.append(True))
+    monkeypatch.setitem(sys.modules, 'cloakbrowser', types.SimpleNamespace(launch_context=launch_context))
+    results = iter([(None, 'login_verification'), ({'success': True}, None)])
+    assert plugin._run_browser(lambda page: next(results)) == ({'success': True}, None)
+    assert routes == [{'server': 'http://proxy.test:7890'}, None]
+    assert closed == [True, True]
+
+
+def test_expired_browser_session_relogs_in_same_page(monkeypatch):
+    plugin = make_plugin()
+    plugin._username, plugin._password = 'fixture-user', 'fixture-password'
+    events = []
+    page = types.SimpleNamespace(
+        context=types.SimpleNamespace(cookies=lambda: [], add_cookies=lambda c: None),
+        goto=lambda *a, **kw: events.append('board'),
+        query_selector=lambda selector: object(),
+        evaluate=lambda *a: {'status': 500, 'body': '{"success":false,"message":"今天已完成签到，请勿重复操作"}'},
+    )
+    monkeypatch.setattr(plugin, '_login_in_page', lambda p: events.append('login'))
+    data, error = plugin._sign_in_page(page, plugin._sign_api)
+    assert events == ['board', 'login', 'board']
+    assert error is None and data['success'] is False

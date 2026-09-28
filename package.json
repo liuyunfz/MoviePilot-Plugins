@@ -39,12 +39,13 @@
     "name": "NodeSeek签到",
     "description": "自动完成 NodeSeek 论坛每日签到，支持随机签到、失败重试，集成CF绕过",
     "labels": "签到,NodeSeek",
-    "version": "1.2.2",
+    "version": "1.2.3",
     "icon": "https://www.nodeseek.com/favicon.ico",
     "author": "liuyunfz",
     "level": 2,
     "v2": true,
     "history": {
+      "v1.2.3": "兼容 CloakBrowser、修复登录入口与代理格式，实际 MoviePilot 验证 Cookie 自动签到",
       "v1.2.2": "修复浏览器 Cookie 与 Service Worker 会话、站点风控回退和 HTTP 500 已签到误判；真实签到验证通过",
       "v1.2.1": "整理发布：修复调度开关、重复任务与停止流程",
       "v1.2.0": "兼容旧配置，支持随机签到、账号登录与浏览器会话模式"
